@@ -1,21 +1,23 @@
 import os
 from collections.abc import Generator
+from functools import lru_cache
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://fileadmin:change-me@localhost:5432/file_metadata",
-)
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+@lru_cache(maxsize=1)
+def _session_factory() -> sessionmaker[Session]:
+    database_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://fileadmin:change-me@localhost:5432/file_metadata",
+    )
+    engine = create_engine(database_url, pool_pre_ping=True)
+    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
 def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
+    db = _session_factory()()
     try:
         yield db
     finally:

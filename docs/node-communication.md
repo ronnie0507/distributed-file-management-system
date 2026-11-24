@@ -11,7 +11,11 @@ Storage node API calls must use bounded retries, timeouts, and idempotency keys.
 uses the file UUID and a virtual-node consistent-hash ring. Replicas are selected from
 distinct ring positions where possible.
 
-## Failure policies
+The current Distribution Engine records administrator-submitted heartbeats and computes
+capacity-aware target nodes. It does not yet send content to independent storage nodes or
+repair replicas. MinIO is the active content backend.
+
+## Planned failure policies
 
 | Scenario | Response |
 |---|---|
@@ -28,6 +32,7 @@ distinct ring positions where possible.
 
 `PENDING -> UPLOADED -> REPLICATING -> AVAILABLE`
 
-Any failed transition is represented by `FAILED` and requires retry or orphan cleanup.
-Upload success is not returned until the metadata transaction and required replicas are
-verified.
+The current upload path commits `PENDING -> UPLOADED` after MinIO and PostgreSQL succeed.
+Transitions to `REPLICATING` and `AVAILABLE`, retry scheduling, and orphan reconciliation
+require the future replication workers. Failed object storage leaves metadata unchanged;
+a metadata commit failure triggers a best-effort object cleanup and surfaces cleanup errors.

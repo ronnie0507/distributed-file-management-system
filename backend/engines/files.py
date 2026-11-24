@@ -2,11 +2,12 @@ import hashlib
 import os
 import tempfile
 from dataclasses import dataclass
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Protocol, cast
 from uuid import UUID
 
 from minio import Minio
 from minio.error import S3Error
+from urllib3.response import BaseHTTPResponse
 
 
 DEFAULT_BUCKET = "distributed-files"
@@ -22,6 +23,14 @@ class StoredContent:
     content_type: str
 
 
+class ObjectReader(Protocol):
+    def read(self, size: int | None = -1, /) -> bytes: ...
+
+    def close(self) -> None: ...
+
+    def release_conn(self) -> None: ...
+
+
 class ObjectStore(Protocol):
     def put_object(
         self,
@@ -33,6 +42,10 @@ class ObjectStore(Protocol):
         content_type: str,
         checksum: str,
     ) -> None: ...
+
+    def get_object(self, *, bucket: str, object_key: str) -> ObjectReader: ...
+
+    def remove_object(self, *, bucket: str, object_key: str) -> None: ...
 
 
 class FileTooLargeError(ValueError):
@@ -64,7 +77,7 @@ class FileEngine:
 
         checksum = hashlib.sha256()
         size_bytes = 0
-        with tempfile.SpooledTemporaryFile(max_size=_CHUNK_SIZE_BYTES, mode="w+b") as spool:
+        with tempfile.TemporaryFile(mode="w+b") as spool:
             while True:
                 chunk = source.read(_CHUNK_SIZE_BYTES)
                 if not chunk:
@@ -81,15 +94,17 @@ class FileEngine:
                 raise ValueError("file content must not be empty")
 
             digest = checksum.hexdigest()
-            object_key = (
-                f"files/{file_id}/versions/{version_number}/{digest}"
+            object_key = self.object_key(
+                file_id=file_id,
+                version_number=version_number,
+                checksum=digest,
             )
             resolved_content_type = content_type or "application/octet-stream"
             spool.seek(0)
             self._object_store.put_object(
                 bucket=self._bucket,
                 object_key=object_key,
-                data=spool,
+                data=cast(BinaryIO, spool),
                 size_bytes=size_bytes,
                 content_type=resolved_content_type,
                 checksum=digest,
@@ -101,6 +116,24 @@ class FileEngine:
             size_bytes=size_bytes,
             content_type=resolved_content_type,
         )
+
+    def open_content(self, object_key: str) -> ObjectReader:
+        return self._object_store.get_object(
+            bucket=self._bucket,
+            object_key=object_key,
+        )
+
+    def delete_content(self, object_key: str) -> None:
+        self._object_store.remove_object(
+            bucket=self._bucket,
+            object_key=object_key,
+        )
+
+    @staticmethod
+    def object_key(*, file_id: UUID, version_number: int, checksum: str) -> str:
+        if version_number < 1:
+            raise ValueError("version_number must be positive")
+        return f"files/{file_id}/versions/{version_number}/{checksum}"
 
 
 class MinioObjectStore:
@@ -146,6 +179,26 @@ class MinioObjectStore:
             content_type=content_type,
             metadata={"sha256": checksum},
         )
+
+    def get_object(self, *, bucket: str, object_key: str) -> ObjectReader:
+        return MinioObjectReader(self._client.get_object(bucket, object_key))
+
+    def remove_object(self, *, bucket: str, object_key: str) -> None:
+        self._client.remove_object(bucket, object_key)
+
+
+class MinioObjectReader:
+    def __init__(self, response: BaseHTTPResponse) -> None:
+        self._response = response
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        return self._response.read(amt=size)
+
+    def close(self) -> None:
+        self._response.close()
+
+    def release_conn(self) -> None:
+        self._response.release_conn()
 
 
 def create_file_engine() -> FileEngine:

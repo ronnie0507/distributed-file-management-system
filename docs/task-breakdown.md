@@ -25,14 +25,14 @@
 
 | ID | Task | Exit condition |
 |---|---|---|
-| E1 | Metadata persistence models | ORM maps users, files, and immutable versions |
+| E1 | Metadata persistence models | ORM maps users, files, versions, permissions, nodes, and health |
 | E2 | Metadata operations | Owner-scoped create, list, lookup, soft delete, and state changes |
-| E3 | File Engine | Content is checksummed and stored/retrieved through MinIO |
-| E4 | Access Engine | API derives owner identity from verified credentials |
-| E5 | Distribution Engine | Replicas are placed and tracked across healthy nodes |
+| E3 | File Engine | Authenticated content upload/download is checksummed and stored in MinIO |
+| E4 | Access Engine | Passwords, signed tokens, and file permissions are verified |
+| E5 | Distribution Engine | Healthy nodes are reported and deterministic replica targets selected |
 
-E1-E3 have started. File API writes remain unwired until E4 provides a trusted
-authenticated owner identity; accepting a client-supplied owner ID would be unsafe.
+E1-E5 are implemented. Physical cross-node replication, repair workers, and restore
+operations remain future work.
 
 ## Team ownership
 

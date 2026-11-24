@@ -1,10 +1,19 @@
 import hashlib
 from io import BytesIO
+from typing import BinaryIO
 from uuid import uuid4
 
 import pytest
 
 from backend.engines.files import FileEngine, FileTooLargeError
+
+
+class MemoryObjectReader(BytesIO):
+    def read(self, size: int | None = -1, /) -> bytes:
+        return super().read(-1 if size is None else size)
+
+    def release_conn(self) -> None:
+        return None
 
 
 class MemoryObjectStore:
@@ -17,7 +26,7 @@ class MemoryObjectStore:
         *,
         bucket: str,
         object_key: str,
-        data: BytesIO,
+        data: BinaryIO,
         size_bytes: int,
         content_type: str,
         checksum: str,
@@ -26,6 +35,12 @@ class MemoryObjectStore:
         assert len(content) == size_bytes
         self.objects[f"{bucket}/{object_key}"] = content
         self.metadata[object_key] = (content_type, checksum)
+
+    def get_object(self, *, bucket: str, object_key: str) -> MemoryObjectReader:
+        return MemoryObjectReader(self.objects[f"{bucket}/{object_key}"])
+
+    def remove_object(self, *, bucket: str, object_key: str) -> None:
+        self.objects.pop(f"{bucket}/{object_key}", None)
 
 
 def test_store_content_streams_to_object_store_with_sha256() -> None:

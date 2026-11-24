@@ -50,6 +50,7 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin-change-me}
       MINIO_BUCKET: ${MINIO_BUCKET:-distributed-files}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
     ports:
       - "8000:8000"
     depends_on:

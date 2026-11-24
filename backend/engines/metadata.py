@@ -31,6 +31,7 @@ class MetadataEngine:
         db: Session,
         *,
         owner_id: UUID,
+        file_id: UUID | None = None,
         filename: str,
         checksum: str,
         file_size: int,
@@ -45,6 +46,7 @@ class MetadataEngine:
             raise ValueError("checksum must be a lowercase SHA-256 digest")
 
         file = FileMetadata(
+            file_id=file_id,
             owner_id=owner_id,
             filename=normalized_filename,
             checksum=checksum,

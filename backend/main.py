@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -5,14 +7,23 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 try:
-    from .api.routes import files, health, nodes
+    from .api.routes import auth, files, health, nodes
+    from .engines.access import access_engine
 except ImportError:
-    from api.routes import files, health, nodes
+    from api.routes import auth, files, health, nodes
+    from engines.access import access_engine
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    access_engine.validate_configuration()
+    yield
 
 
 app = FastAPI(
     title="Distributed File Metadata Access and Management System",
-    version="0.2.0",
+    version="0.3.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -24,6 +35,7 @@ app.add_middleware(
 )
 
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(files.router)
 app.include_router(nodes.router)
 
@@ -66,7 +78,14 @@ async def validation_exception_handler(
                 "code": "VALIDATION_ERROR",
                 "message": "The request contains invalid fields.",
                 "path": str(request.url.path),
-                "details": exc.errors(),
+                "details": [
+                    {
+                        key: value
+                        for key, value in error.items()
+                        if key != "input"
+                    }
+                    for error in exc.errors()
+                ],
             }
         },
     )
