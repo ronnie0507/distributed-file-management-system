@@ -28,6 +28,117 @@ services:
       timeout: 5s
       retries: 20
 
+  rabbitmq:
+    image: rabbitmq:3.13-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-dfms-worker}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - worker-internal
+
+  etcd-1:
+    image: quay.io/coreos/etcd:v3.5.21
+    environment:
+      ETCD_ROOT_PASSWORD: ${ETCD_ROOT_PASSWORD:?Set ETCD_ROOT_PASSWORD in .env}
+    command:
+      - --name=etcd-1
+      - --data-dir=/etcd-data
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd-1:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd-1:2379
+      - --initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=dfms-local-etcd
+    volumes:
+      - etcd_1_data:/etcd-data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 --user="root:$${ETCD_ROOT_PASSWORD}" endpoint health
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - worker-internal
+
+  etcd-2:
+    image: quay.io/coreos/etcd:v3.5.21
+    environment:
+      ETCD_ROOT_PASSWORD: ${ETCD_ROOT_PASSWORD:?Set ETCD_ROOT_PASSWORD in .env}
+    command:
+      - --name=etcd-2
+      - --data-dir=/etcd-data
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd-2:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd-2:2379
+      - --initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=dfms-local-etcd
+    volumes:
+      - etcd_2_data:/etcd-data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 --user="root:$${ETCD_ROOT_PASSWORD}" endpoint health
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - worker-internal
+
+  etcd-3:
+    image: quay.io/coreos/etcd:v3.5.21
+    environment:
+      ETCD_ROOT_PASSWORD: ${ETCD_ROOT_PASSWORD:?Set ETCD_ROOT_PASSWORD in .env}
+    command:
+      - --name=etcd-3
+      - --data-dir=/etcd-data
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd-3:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd-3:2379
+      - --initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=dfms-local-etcd
+    volumes:
+      - etcd_3_data:/etcd-data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 --user="root:$${ETCD_ROOT_PASSWORD}" endpoint health
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - worker-internal
+
+  etcd-auth-bootstrap:
+    build:
+      context: ./infrastructure/etcd
+    environment:
+      ETCD_ROOT_PASSWORD: ${ETCD_ROOT_PASSWORD:?Set ETCD_ROOT_PASSWORD in .env}
+      ETCD_USERNAME: ${ETCD_USERNAME:-dfms-worker}
+      ETCD_PASSWORD: ${ETCD_PASSWORD:?Set ETCD_PASSWORD in .env}
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    networks:
+      - worker-internal
+
   minio-node-1:
     image: minio/minio:latest
     command: server /data
@@ -159,8 +270,27 @@ services:
       STORAGE_HEARTBEAT_TTL_SECONDS: ${STORAGE_HEARTBEAT_TTL_SECONDS:-60}
       REPLICATION_JOB_LEASE_SECONDS: ${REPLICATION_JOB_LEASE_SECONDS:-300}
       REPLICATION_MAX_ATTEMPTS: ${REPLICATION_MAX_ATTEMPTS:-5}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-dfms-worker}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+      RABBITMQ_CONNECTION_TIMEOUT_SECONDS: ${RABBITMQ_CONNECTION_TIMEOUT_SECONDS:-5}
+      ETCD_ENDPOINTS: etcd-1:2379,etcd-2:2379,etcd-3:2379
+      ETCD_USERNAME: ${ETCD_USERNAME:-dfms-worker}
+      ETCD_PASSWORD: ${ETCD_PASSWORD:?Set ETCD_PASSWORD in .env}
+      ETCD_TIMEOUT_SECONDS: ${ETCD_TIMEOUT_SECONDS:-5}
+      ETCD_MEMBERSHIP_TTL_SECONDS: ${ETCD_MEMBERSHIP_TTL_SECONDS:-30}
+      ETCD_LEADER_TTL_SECONDS: ${ETCD_LEADER_TTL_SECONDS:-30}
+      COORDINATION_POLL_SECONDS: ${COORDINATION_POLL_SECONDS:-5}
+      RECONCILIATION_INTERVAL_SECONDS: ${RECONCILIATION_INTERVAL_SECONDS:-30}
+      OUTBOX_POLL_SECONDS: ${OUTBOX_POLL_SECONDS:-1}
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      etcd-auth-bootstrap:
         condition: service_completed_successfully
       minio-node-1:
         condition: service_started
@@ -168,6 +298,9 @@ services:
         condition: service_started
       minio-node-3:
         condition: service_started
+    networks:
+      - default
+      - worker-internal
 
   nginx:
     image: nginx:1.27-alpine
@@ -185,3 +318,11 @@ volumes:
   minio_node_2_data:
   minio_node_3_data:
   minio_node_4_data:
+  rabbitmq_data:
+  etcd_1_data:
+  etcd_2_data:
+  etcd_3_data:
+
+networks:
+  worker-internal:
+    internal: true

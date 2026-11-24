@@ -36,6 +36,16 @@ planned for a later phase.
 - [x] Health-based recovery and replacement-node repair
 - [ ] Live PostgreSQL/MinIO integration verification (Docker engine unavailable)
 
+## Phase 5 - Coordination and Reliable Processing
+
+- [x] Transactional outbox for durable job publication
+- [x] RabbitMQ durable queues, publisher confirms, manual acknowledgements, and dead-letter routing
+- [x] Fenced PostgreSQL job and per-file work leases for multi-worker execution
+- [x] Leased etcd storage membership and recovery-coordinator election
+- [x] Reconciliation, integrity verification, replica repair, and soft-delete cleanup jobs
+- [x] Unit coverage for duplicate delivery, retry, lease takeover, broker failure, and quorum loss
+- [ ] Live PostgreSQL/RabbitMQ/etcd integration verification (Docker engine unavailable)
+
 ## Quick start
 
 Prerequisites: Docker Desktop, Docker Compose, Python 3.11+, and Git.
@@ -44,19 +54,22 @@ Prerequisites: Docker Desktop, Docker Compose, Python 3.11+, and Git.
 Copy-Item .env.example .env
 ```
 
-Set `JWT_SECRET_KEY` and the database/storage credentials in `.env` to unique
-values before starting the services. Values in `.env.example` are local-only
-placeholders, not production credentials.
+Set `JWT_SECRET_KEY` and the database, storage, RabbitMQ, and etcd credentials in
+`.env` to unique values before starting the services. Values in `.env.example`
+are local-only placeholders, not production credentials. The etcd root password
+and application service-account password must be different.
 
 ```powershell
 docker compose up --build
 ```
 
 Compose initializes the legacy schema for a new PostgreSQL volume, then runs the
-Alembic Phase 4 upgrade before starting the API and replication worker. The
-worker provisions configured node records, reports health, verifies legacy
-objects on node 1 for upgrade compatibility, and processes durable replication
-jobs.
+Alembic upgrades before starting the API and worker. The worker publishes
+transactional outbox events to RabbitMQ and consumes durable jobs. A leased etcd
+election selects one worker for health refresh and periodic reconciliation;
+PostgreSQL remains authoritative for files, replicas, jobs, and worker fencing.
+The worker provisions configured node records and checksum-verifies legacy
+objects on node 1 for upgrade compatibility.
 
 The local stack exposes:
 
@@ -66,11 +79,15 @@ The local stack exposes:
 - PostgreSQL: `localhost:5432`
 - Redis: `localhost:6379`
 
-MinIO endpoints are private to the Compose network and have separate persistent
-volumes. Node 1 reuses the previous `minio_data` volume; nodes 2 and 3 use new
-volumes. The three containers still share one Docker host/daemon and therefore
-are a development simulation, not physical fault domains. Production fault
-tolerance requires independently managed hosts or storage services.
+RabbitMQ, etcd, and MinIO endpoints have no published host ports. RabbitMQ and
+the three etcd members use a worker-only internal Compose network; the etcd
+bootstrap creates a root account and a separate least-privilege worker account.
+MinIO nodes have separate persistent volumes. Node 1 reuses the previous
+`minio_data` volume; nodes 2 and 3 use new volumes. The three etcd members and
+storage containers still share one Docker host/daemon, so this is a development
+simulation, not physical fault tolerance. Three etcd members require two for
+quorum; losing quorum pauses leader-only maintenance, while workers continue
+processing already-published jobs using PostgreSQL fencing.
 
 The default replication factor and active storage-node count are both three.
 The optional fourth MinIO endpoint is a spare with its own volume. To activate
@@ -82,7 +99,12 @@ recovers or a replacement is activated.
 Replication failures are recorded in PostgreSQL `replication_jobs` and replica
 state/error fields. Admins can retry a dead job with
 `POST /api/nodes/replication-jobs/{job_id}/retry`. The worker claims jobs using
-PostgreSQL row locks and expiring leases; RabbitMQ is intentionally deferred.
+PostgreSQL row locks, expiring leases, and fencing tokens. Job delivery is
+at-least-once: the outbox relay marks an event published only after a RabbitMQ
+confirm, and a crash between broker confirmation and the database update can
+publish a duplicate. Consumers deduplicate through the PostgreSQL job row and
+per-file lease. Bounded job attempts end in the database `DEAD` state and
+dead-letter queue; outbox publication retries during a broker outage.
 
 Stop with `docker compose down`. Add `-v` only when intentionally deleting
 development data.
@@ -103,9 +125,9 @@ Local validation uses SQLite and in-memory storage adapters:
 docker compose --env-file .env.example config --quiet
 ```
 
-These checks do not replace live Postgres/MinIO integration tests. If the Docker
-daemon is unavailable, Compose startup, migrations against PostgreSQL, and real
-multi-node transfers remain unverified.
+These checks do not replace live integration tests. If the Docker daemon is
+unavailable, Compose startup, PostgreSQL migrations, RabbitMQ delivery, etcd
+leases/election, and real multi-node transfers remain unverified.
 
 ## Repository layout
 

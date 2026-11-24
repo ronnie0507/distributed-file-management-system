@@ -286,6 +286,20 @@ def delete_file(
             status_code=404,
             detail={"code": "FILE_NOT_FOUND", "message": "File not found."},
         )
+    versions = db.scalars(
+        select(FileVersion).where(FileVersion.file_id == file_id)
+    )
+    for version in versions:
+        replication_engine.enqueue(
+            db,
+            file_id=file_id,
+            version_id=version.version_id,
+            target_count=1,
+            idempotency_key=(
+                f"file:{file_id}:version:{version.version_number}:cleanup"
+            ),
+            job_type="CLEANUP",
+        )
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

@@ -6,7 +6,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -14,6 +14,7 @@ from backend.database.base import Base
 from backend.database.models import (
     FileReplica,
     FileVersion,
+    OutboxEvent,
     ReplicationJob,
     StorageNode,
     User,
@@ -310,7 +311,7 @@ def test_password_is_not_reflected_in_validation_errors(api_client) -> None:
 
 
 def test_file_metadata_and_delete_are_owner_scoped(api_client) -> None:
-    client, headers, _, _ = api_client
+    client, headers, session_factory, _ = api_client
     listing = client.get("/api/files", headers=headers).json()
     file_id = listing["items"][0]["file_id"]
 
@@ -321,6 +322,14 @@ def test_file_metadata_and_delete_are_owner_scoped(api_client) -> None:
     deleted = client.delete(f"/api/files/{file_id}", headers=headers)
     assert deleted.status_code == 204
     assert client.get(f"/api/files/{file_id}", headers=headers).status_code == 404
+    with session_factory() as db:
+        cleanup_job = db.scalar(
+            select(ReplicationJob).where(ReplicationJob.job_type == "CLEANUP")
+        )
+        assert cleanup_job is not None
+        assert db.scalar(
+            select(OutboxEvent).where(OutboxEvent.job_id == cleanup_job.job_id)
+        ) is not None
 
 
 def test_other_account_cannot_read_or_delete_a_file(api_client) -> None:

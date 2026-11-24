@@ -1,4 +1,4 @@
-# Phase 1 Architecture
+# System Architecture
 
 ## Logical layers
 
@@ -20,18 +20,13 @@ flowchart TB
     A --> D
 
     M --> PG[(PostgreSQL)]
-    D --> ETCD[(etcd Cluster)]
+    D --> PG
     AC --> PG
-    D --> H[Node Health Registry]
-
-    subgraph MC[Metadata Service Cluster]
-        MN1[Metadata Node 1 / Leader]
-        MN2[Metadata Node 2 / Follower]
-        MN3[Metadata Node 3 / Follower]
-    end
-
-    M --> MC
-    MC --> PG
+    W[Replication Workers] --> PG
+    W <--> MQ[RabbitMQ]
+    W <--> ETCD[3-member etcd Cluster]
+    PG --> O[Transactional Outbox]
+    O --> MQ
 
     subgraph SC[Distributed Storage Cluster]
         SN1[Storage Node 1]
@@ -40,6 +35,7 @@ flowchart TB
     end
 
     D --> SC
+    W --> SC
 
     F --> R[Redis Cache]
     R --> PG
@@ -52,12 +48,16 @@ flowchart TB
 | File Engine | Upload validation, SHA-256, versions, integrity | Object storage and metadata operations |
 | Metadata Engine | File IDs, metadata, versions, replica references | PostgreSQL |
 | Access Engine | JWT validation, RBAC, ownership, audit events | PostgreSQL and audit log |
-| Distribution Engine | Placement, health, replication, leader coordination | Node registry, storage nodes, etcd |
+| Distribution Engine | Placement, health, replication, availability | PostgreSQL node registry, storage nodes |
+| Replication worker | Durable job execution, verification, repair, reconciliation | PostgreSQL, RabbitMQ, etcd, storage nodes |
 
 ## Infrastructure boundaries
 
-- PostgreSQL is the authoritative metadata store for the initial implementation.
+- PostgreSQL is authoritative for file metadata, replica records, jobs, and outbox events.
 - Redis is a cache and must never be treated as authoritative.
 - MinIO or storage-node APIs hold file content only.
-- etcd coordinates metadata leader election; it is not the metadata database.
+- RabbitMQ transports durable background-job notifications; PostgreSQL outbox events
+  prevent committed work from being lost during broker outages.
+- etcd coordinates leased storage membership and elects one recovery coordinator; it
+  is not the metadata database. A three-member cluster needs two members for quorum.
 - Nginx routes external traffic and later applies request limits and TLS termination.

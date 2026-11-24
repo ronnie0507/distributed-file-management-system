@@ -1,33 +1,76 @@
 import logging
 import os
 import time
+from threading import Thread
 from datetime import datetime, timezone
 from time import perf_counter
+from uuid import UUID
 
+from pika.exceptions import AMQPError
 from minio.error import S3Error
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from urllib3.exceptions import HTTPError
 
 if __package__ == "backend.workers":
-    from ..database.models import FileMetadata, FileReplica, FileVersion, StorageNode
+    from ..coordination.etcd import (
+        CoordinationUnavailableError,
+        EtcdCoordinator,
+        create_etcd_coordinator,
+    )
+    from ..database.models import (
+        FileMetadata,
+        FileReplica,
+        FileVersion,
+        ReplicationJob,
+        StorageNode,
+    )
     from ..database.session import get_session_factory
     from ..engines.distribution import distribution_engine
     from ..engines.files import ChecksumMismatchError, FileEngine
+    from ..engines.outbox import outbox_engine
     from ..engines.replication import ReplicationEngine, replication_engine
     from ..engines.storage import StorageRegistry, create_storage_registry
+    from ..messaging.rabbitmq import (
+        JobMessage,
+        PermanentJobError,
+        RabbitMQConfig,
+        RabbitMQTransport,
+    )
+    from .outbox_publisher import OutboxDispatcher
 else:
-    from database.models import FileMetadata, FileReplica, FileVersion, StorageNode
+    from coordination.etcd import (
+        CoordinationUnavailableError,
+        EtcdCoordinator,
+        create_etcd_coordinator,
+    )
+    from database.models import (
+        FileMetadata,
+        FileReplica,
+        FileVersion,
+        ReplicationJob,
+        StorageNode,
+    )
     from database.session import get_session_factory
     from engines.distribution import distribution_engine
     from engines.files import ChecksumMismatchError, FileEngine
+    from engines.outbox import outbox_engine
     from engines.replication import ReplicationEngine, replication_engine
     from engines.storage import StorageRegistry, create_storage_registry
+    from messaging.rabbitmq import (
+        JobMessage,
+        PermanentJobError,
+        RabbitMQConfig,
+        RabbitMQTransport,
+    )
+    from workers.outbox_publisher import OutboxDispatcher
 
 
 _LOGGER = logging.getLogger(__name__)
 _POLL_INTERVAL_SECONDS = float(os.getenv("REPLICATION_POLL_SECONDS", "2"))
 _HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("STORAGE_HEALTH_INTERVAL_SECONDS", "10"))
+_COORDINATION_INTERVAL_SECONDS = float(os.getenv("COORDINATION_POLL_SECONDS", "5"))
+_MAINTENANCE_INTERVAL_SECONDS = float(os.getenv("RECONCILIATION_INTERVAL_SECONDS", "30"))
 _RETRYABLE_HEALTH_ERRORS = (HTTPError, S3Error, OSError)
 
 
@@ -39,6 +82,8 @@ class ReplicationWorker:
         *,
         engine: ReplicationEngine = replication_engine,
         health_interval_seconds: float = _HEARTBEAT_INTERVAL_SECONDS,
+        broker: RabbitMQTransport | None = None,
+        coordinator: EtcdCoordinator | None = None,
     ) -> None:
         if health_interval_seconds <= 0:
             raise ValueError("health_interval_seconds must be positive")
@@ -47,6 +92,8 @@ class ReplicationWorker:
         self._engine = engine
         self._health_interval_seconds = health_interval_seconds
         self._last_health_check = 0.0
+        self._broker = broker
+        self._coordinator = coordinator
 
     def run_once(self) -> bool:
         with self._session_factory() as db:
@@ -70,10 +117,132 @@ class ReplicationWorker:
             )
 
     def run_forever(self) -> None:
+        broker = self._broker or RabbitMQTransport(RabbitMQConfig.from_env())
+        coordinator = self._coordinator or create_etcd_coordinator()
+        dispatcher = OutboxDispatcher(
+            self._session_factory,
+            broker,
+        )
+        Thread(
+            target=dispatcher.run_forever,
+            name="outbox-publisher",
+            daemon=True,
+        ).start()
+        Thread(
+            target=self._run_coordination_forever,
+            args=(coordinator,),
+            name="etcd-coordination",
+            daemon=True,
+        ).start()
         while True:
-            processed = self.run_once()
-            if not processed:
+            try:
+                broker.consume_forever(self._handle_job_message)
+            except (
+                AMQPError,
+                OSError,
+                TimeoutError,
+            ):
+                _LOGGER.exception("RabbitMQ connection failed; reconnecting")
                 time.sleep(_POLL_INTERVAL_SECONDS)
+
+    def _handle_job_message(self, message: JobMessage) -> None:
+        try:
+            job_id = UUID(message.payload["job_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PermanentJobError("Message does not contain a valid job_id") from exc
+        if job_id != message.job_id:
+            raise PermanentJobError("Message job_id does not match its payload")
+
+        with self._session_factory() as db:
+            job = db.get(ReplicationJob, job_id)
+            if job is None:
+                raise PermanentJobError(f"Background job {job_id} does not exist")
+            if job.status == "COMPLETED":
+                return
+            if job.status == "DEAD":
+                raise PermanentJobError(
+                    f"Background job {job_id} reached its retry limit"
+                )
+            token = self._engine.claim_job(db, job_id=job_id)
+            db.commit()
+        if token is None:
+            with self._session_factory() as db:
+                job = db.get(ReplicationJob, job_id)
+                if job is not None and job.status == "DEAD":
+                    raise PermanentJobError(
+                        f"Background job {job_id} reached its retry limit"
+                    )
+            return
+
+        with self._session_factory() as db:
+            self._engine.process(
+                db,
+                job_id=job_id,
+                storage=self._storage,
+                lock_token=token,
+            )
+            job = db.get(ReplicationJob, job_id)
+            if job is not None and job.status == "DEAD":
+                raise PermanentJobError(
+                    f"Background job {job_id} reached its retry limit"
+                )
+
+    def _run_coordination_forever(self, coordinator: EtcdCoordinator) -> None:
+        last_maintenance = 0.0
+        while True:
+            try:
+                leader = coordinator.try_acquire_recovery_leadership()
+                if leader:
+                    if (
+                        time.monotonic() - self._last_health_check
+                        >= self._health_interval_seconds
+                    ):
+                        with self._session_factory() as db:
+                            self._refresh_nodes(db)
+                            self._backfill_legacy_replicas(db)
+                        self._last_health_check = time.monotonic()
+                    self._register_storage_membership(coordinator)
+                    if (
+                        time.monotonic() - last_maintenance
+                        >= _MAINTENANCE_INTERVAL_SECONDS
+                    ):
+                        with self._session_factory() as db:
+                            self._engine.schedule_maintenance(db)
+                            outbox_engine.reconcile_jobs(db)
+                            db.commit()
+                        last_maintenance = time.monotonic()
+                else:
+                    self._register_storage_membership(coordinator)
+            except CoordinationUnavailableError:
+                _LOGGER.warning(
+                    "etcd coordination is unavailable; leader-only maintenance "
+                    "is paused while PostgreSQL-backed jobs continue",
+                    exc_info=True,
+                )
+            except Exception:
+                _LOGGER.exception("Worker coordination cycle failed")
+            time.sleep(_COORDINATION_INTERVAL_SECONDS)
+
+    def _register_storage_membership(
+        self,
+        coordinator: EtcdCoordinator,
+    ) -> None:
+        with self._session_factory() as db:
+            for configured in self._storage.configured_nodes:
+                node = db.scalar(
+                    select(StorageNode).where(
+                        StorageNode.node_name == configured.node_name
+                    )
+                )
+                if node is None:
+                    continue
+                coordinator.register_membership(
+                    node_id=node.node_id,
+                    node_name=node.node_name,
+                    endpoint=configured.node_address,
+                    status=node.status,
+                    capacity_bytes=node.capacity_bytes,
+                )
 
     def _refresh_nodes(self, db: Session) -> None:
         for configured in self._storage.configured_nodes:

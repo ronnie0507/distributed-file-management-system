@@ -88,6 +88,8 @@ class FileMetadata(Base):
     replication_factor: Mapped[int] = mapped_column(
         Integer, nullable=False, default=3
     )
+    work_lock_token: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    work_locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -233,9 +235,17 @@ class ReplicationJob(Base):
             "status IN ('PENDING', 'PROCESSING', 'RETRY', 'COMPLETED', 'DEAD')",
             name="replication_jobs_status_check",
         ),
+        CheckConstraint(
+            "job_type IN ('REPLICATE', 'VERIFY', 'CLEANUP', 'RECONCILE')",
+            name="replication_jobs_type_check",
+        ),
         CheckConstraint("target_count > 0", name="replication_jobs_target_count_check"),
         CheckConstraint("attempt_count >= 0", name="replication_jobs_attempt_count_check"),
         CheckConstraint("max_attempts > 0", name="replication_jobs_max_attempts_check"),
+        CheckConstraint(
+            "dispatch_generation >= 0",
+            name="replication_jobs_dispatch_generation_check",
+        ),
         UniqueConstraint("idempotency_key", name="uq_replication_job_idempotency"),
         Index("idx_replication_jobs_due", "status", "available_at"),
     )
@@ -253,15 +263,75 @@ class ReplicationJob(Base):
         ForeignKey("file_versions.version_id", ondelete="CASCADE"),
         nullable=False,
     )
+    job_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="REPLICATE"
+    )
     target_count: Mapped[int] = mapped_column(Integer, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    dispatch_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lock_token: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'PUBLISHING', 'PUBLISHED')",
+            name="outbox_events_status_check",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="outbox_events_attempt_count_check",
+        ),
+        UniqueConstraint("event_key", name="uq_outbox_event_key"),
+        Index("idx_outbox_events_due", "status", "available_at"),
+        Index("idx_outbox_events_job_id", "job_id"),
+    )
+
+    event_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("replication_jobs.job_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_key: Mapped[str] = mapped_column(String(300), nullable=False)
+    event_type: Mapped[str] = mapped_column(
+        String(80), nullable=False, default="background_job"
+    )
+    payload: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=False, default=dict
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="PENDING"
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lock_token: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

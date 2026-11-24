@@ -15,6 +15,7 @@ from backend.database.models import (
     FileMetadata,
     FileReplica,
     FileVersion,
+    OutboxEvent,
     ReplicationJob,
     StorageNode,
     User,
@@ -22,8 +23,11 @@ from backend.database.models import (
 from backend.engines.distribution import DistributionEngine
 from backend.engines.files import FileEngine
 from backend.engines.metadata import metadata_engine
+from backend.engines.outbox import OutboxEngine
 from backend.engines.replication import ReplicationEngine
 from backend.engines.storage import ConfiguredStorageNode, StorageRegistry
+from backend.messaging.rabbitmq import JobMessage
+from backend.workers.outbox_publisher import OutboxDispatcher
 from backend.workers.replication_worker import ReplicationWorker
 
 
@@ -251,6 +255,12 @@ def _process_next(environment: ReplicationEnvironment) -> bool:
     )
 
 
+def _get_job(environment: ReplicationEnvironment, job_id: UUID) -> ReplicationJob:
+    job = environment.db.get(ReplicationJob, job_id)
+    assert job is not None
+    return job
+
+
 def test_replication_verifies_sha256_on_three_distinct_nodes(
     replication_environment: ReplicationEnvironment,
 ) -> None:
@@ -294,7 +304,7 @@ def test_unhealthy_node_is_not_selected_for_replication(
             FileReplica.node_id == environment.nodes[2].node_id
         )
     ) == 0
-    assert environment.db.get(ReplicationJob, environment.job_id).status == "RETRY"
+    assert _get_job(environment, environment.job_id).status == "RETRY"
 
 
 def test_partial_replication_failure_retries_without_losing_valid_replicas(
@@ -315,22 +325,22 @@ def test_partial_replication_failure_retries_without_losing_valid_replicas(
             FileReplica.status == "VERIFIED"
         )
     ) == 2
-    assert environment.db.get(ReplicationJob, environment.job_id).status == "RETRY"
+    assert _get_job(environment, environment.job_id).status == "RETRY"
 
     environment.stores[failing_target.node_name].fail_put = False
-    job = environment.db.get(ReplicationJob, environment.job_id)
+    job = _get_job(environment, environment.job_id)
     job.available_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     environment.db.commit()
 
     assert _process_next(environment)
-    assert environment.db.get(ReplicationJob, environment.job_id).status == "COMPLETED"
+    assert _get_job(environment, environment.job_id).status == "COMPLETED"
 
 
 def test_duplicate_jobs_are_idempotent(
     replication_environment: ReplicationEnvironment,
 ) -> None:
     environment = replication_environment
-    job = environment.db.get(ReplicationJob, environment.job_id)
+    job = _get_job(environment, environment.job_id)
     duplicate = environment.replication.enqueue(
         environment.db,
         file_id=job.file_id,
@@ -341,13 +351,370 @@ def test_duplicate_jobs_are_idempotent(
 
     assert duplicate.job_id == job.job_id
     assert environment.db.scalar(select(func.count()).select_from(ReplicationJob)) == 1
+    assert environment.db.scalar(select(func.count()).select_from(OutboxEvent)) == 1
+
+
+def test_outbox_publication_uses_expiring_fenced_claims(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+    outbox = OutboxEngine(lease_seconds=10)
+    started = datetime.now(timezone.utc)
+
+    first = outbox.claim_next(environment.db, now=started)
+    assert first is not None
+    environment.db.commit()
+    replacement = outbox.claim_next(
+        environment.db,
+        now=started + timedelta(seconds=11),
+    )
+    assert replacement is not None
+    environment.db.commit()
+
+    assert not outbox.mark_published(
+        environment.db,
+        claim=first,
+        now=started + timedelta(seconds=12),
+    )
+    assert outbox.mark_published(
+        environment.db,
+        claim=replacement,
+        now=started + timedelta(seconds=12),
+    )
+    environment.db.commit()
+    event = environment.db.scalar(select(OutboxEvent))
+    assert event is not None
+    assert event.status == "PUBLISHED"
+    assert event.lock_token is None
+
+
+def test_outbox_releases_failed_publish_for_bounded_backoff(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+    outbox = OutboxEngine()
+    now = datetime.now(timezone.utc)
+    claim = outbox.claim_next(environment.db, now=now)
+    assert claim is not None
+    environment.db.commit()
+
+    assert outbox.release_for_retry(
+        environment.db,
+        claim=claim,
+        error="broker unavailable",
+        now=now,
+    )
+    environment.db.commit()
+    event = environment.db.get(OutboxEvent, claim.event_id)
+    assert event is not None
+    assert event.status == "PENDING"
+    assert event.lock_token is None
+    assert event.last_error == "broker unavailable"
+    available_at = event.available_at
+    if available_at.tzinfo is None:
+        available_at = available_at.replace(tzinfo=timezone.utc)
+    assert available_at > now
+
+
+def test_dispatcher_marks_event_published_only_after_confirm(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+
+    class Publisher:
+        def __init__(self) -> None:
+            self.published: list[dict] = []
+
+        def publish(self, **kwargs) -> None:
+            self.published.append(kwargs)
+
+    publisher = Publisher()
+    dispatcher = OutboxDispatcher(
+        environment.session_factory,
+        publisher,
+        poll_interval_seconds=0.1,
+    )
+
+    assert dispatcher.run_once()
+
+    environment.db.expire_all()
+    event = environment.db.scalar(select(OutboxEvent))
+    assert event is not None
+    assert event.status == "PUBLISHED"
+    assert publisher.published[0]["event_id"] == event.event_id
+
+
+def test_dispatcher_keeps_event_pending_when_broker_is_unavailable(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+
+    class OfflinePublisher:
+        def publish(self, **_kwargs) -> None:
+            raise OSError("broker unavailable")
+
+    dispatcher = OutboxDispatcher(
+        environment.session_factory,
+        OfflinePublisher(),
+        poll_interval_seconds=0.1,
+    )
+
+    assert dispatcher.run_once()
+
+    environment.db.expire_all()
+    event = environment.db.scalar(select(OutboxEvent))
+    assert event is not None
+    assert event.status == "PENDING"
+    assert event.attempt_count == 1
+    assert event.last_error == "broker unavailable"
+
+
+def test_outbox_reconciliation_recovers_jobs_without_events(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+    job = environment.db.get(ReplicationJob, environment.job_id)
+    assert job is not None
+    environment.db.query(OutboxEvent).delete()
+    job.dispatch_generation = 0
+    environment.db.commit()
+
+    assert OutboxEngine().reconcile_jobs(environment.db) == 1
+    environment.db.commit()
+
+    event = environment.db.scalar(select(OutboxEvent))
+    assert event is not None
+    assert event.job_id == job.job_id
+    assert event.status == "PENDING"
+
+
+def test_stale_worker_cannot_update_job_after_lease_takeover(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+    started = datetime.now(timezone.utc)
+    first_token = environment.replication.claim_job(
+        environment.db,
+        job_id=environment.job_id,
+        now=started,
+    )
+    environment.db.commit()
+    replacement_token = environment.replication.claim_job(
+        environment.db,
+        job_id=environment.job_id,
+        now=started + timedelta(seconds=301),
+    )
+    environment.db.commit()
+
+    assert first_token is not None
+    assert replacement_token is not None
+    assert first_token != replacement_token
+    assert not environment.replication.process(
+        environment.db,
+        job_id=environment.job_id,
+        storage=environment.storage,
+        lock_token=first_token,
+    )
+    job = environment.db.get(ReplicationJob, environment.job_id)
+    assert job is not None
+    assert job.status == "PROCESSING"
+    assert job.lock_token == replacement_token
+
+
+def test_jobs_for_one_file_are_serialized_and_waiting_work_is_woken(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+    version = environment.db.scalar(
+        select(FileVersion).where(FileVersion.file_id == environment.file.file_id)
+    )
+    assert version is not None
+    verification = environment.replication.enqueue(
+        environment.db,
+        file_id=environment.file.file_id,
+        version_id=version.version_id,
+        target_count=1,
+        idempotency_key=f"file:{environment.file.file_id}:verify:serialized",
+        job_type="VERIFY",
+    )
+    first_event = environment.db.scalar(
+        select(OutboxEvent).where(OutboxEvent.job_id == environment.job_id)
+    )
+    assert first_event is not None
+    first_event.status = "PUBLISHED"
+    first_event.published_at = datetime.now(timezone.utc)
+    environment.db.commit()
+
+    now = datetime.now(timezone.utc)
+    replication_token = environment.replication.claim_job(
+        environment.db,
+        job_id=environment.job_id,
+        now=now,
+    )
+    environment.db.commit()
+    waiting_token = environment.replication.claim_job(
+        environment.db,
+        job_id=verification.job_id,
+        now=now + timedelta(seconds=1),
+    )
+    environment.db.commit()
+
+    assert replication_token is not None
+    assert waiting_token is None
+    assert _get_job(environment, verification.job_id).last_error == (
+        "Waiting for another background job on this file"
+    )
+    assert environment.replication.process(
+        environment.db,
+        job_id=environment.job_id,
+        storage=environment.storage,
+        lock_token=replication_token,
+    )
+    environment.db.expire_all()
+
+    waiting_job = environment.db.get(ReplicationJob, verification.job_id)
+    assert waiting_job is not None
+    assert waiting_job.status == "RETRY"
+    available_at = waiting_job.available_at
+    if available_at.tzinfo is None:
+        available_at = available_at.replace(tzinfo=timezone.utc)
+    assert available_at <= datetime.now(timezone.utc)
+    waiting_token = environment.replication.claim_job(
+        environment.db,
+        job_id=verification.job_id,
+    )
+    environment.db.commit()
+    assert waiting_token is not None
+
+
+def test_worker_duplicate_delivery_is_idempotent(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+    event = environment.db.scalar(select(OutboxEvent))
+    assert event is not None
+    worker = ReplicationWorker(
+        environment.session_factory,
+        environment.storage,
+        engine=environment.replication,
+    )
+    message = JobMessage(
+        event_id=event.event_id,
+        job_id=environment.job_id,
+        event_key=event.event_key,
+        payload=event.payload,
+    )
+
+    worker._handle_job_message(message)
+    worker._handle_job_message(message)
+
+    environment.db.expire_all()
+    job = environment.db.get(ReplicationJob, environment.job_id)
+    assert job is not None
+    assert job.status == "COMPLETED"
+    assert job.attempt_count == 1
+    assert environment.db.scalar(
+        select(func.count()).select_from(FileReplica).where(
+            FileReplica.status == "VERIFIED"
+        )
+    ) == 3
+
+
+def test_integrity_verification_marks_corruption_and_queues_repair(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+    source = environment.db.scalar(
+        select(FileReplica).where(FileReplica.node_id == environment.nodes[0].node_id)
+    )
+    assert source is not None
+    environment.stores["node-1"].objects[
+        f"distributed-files/{source.object_key}"
+    ] = b"corrupted"
+    version = environment.db.scalar(
+        select(FileVersion).where(FileVersion.file_id == environment.file.file_id)
+    )
+    assert version is not None
+    verification = environment.replication.enqueue(
+        environment.db,
+        file_id=environment.file.file_id,
+        version_id=version.version_id,
+        target_count=1,
+        idempotency_key=f"file:{environment.file.file_id}:verify:test",
+        job_type="VERIFY",
+    )
+    environment.db.commit()
+    token = environment.replication.claim_job(
+        environment.db,
+        job_id=verification.job_id,
+    )
+    environment.db.commit()
+    assert token is not None
+
+    assert environment.replication.process(
+        environment.db,
+        job_id=verification.job_id,
+        storage=environment.storage,
+        lock_token=token,
+    )
+
+    assert source.status == "CORRUPT"
+    assert _get_job(environment, verification.job_id).status == "COMPLETED"
+    assert environment.db.scalar(
+        select(func.count())
+        .select_from(ReplicationJob)
+        .where(ReplicationJob.job_type == "REPLICATE")
+    ) == 1
+
+
+def test_cleanup_job_deletes_objects_only_after_soft_deletion(
+    replication_environment: ReplicationEnvironment,
+) -> None:
+    environment = replication_environment
+    source = environment.db.scalar(
+        select(FileReplica).where(FileReplica.node_id == environment.nodes[0].node_id)
+    )
+    version = environment.db.scalar(
+        select(FileVersion).where(FileVersion.file_id == environment.file.file_id)
+    )
+    assert source is not None and version is not None
+    environment.file.deleted_at = datetime.now(timezone.utc)
+    cleanup = environment.replication.enqueue(
+        environment.db,
+        file_id=environment.file.file_id,
+        version_id=version.version_id,
+        target_count=1,
+        idempotency_key=f"file:{environment.file.file_id}:cleanup:test",
+        job_type="CLEANUP",
+    )
+    environment.db.commit()
+    token = environment.replication.claim_job(
+        environment.db,
+        job_id=cleanup.job_id,
+    )
+    environment.db.commit()
+    assert token is not None
+
+    assert environment.replication.process(
+        environment.db,
+        job_id=cleanup.job_id,
+        storage=environment.storage,
+        lock_token=token,
+    )
+
+    assert source.status == "DELETED"
+    assert (
+        f"distributed-files/{source.object_key}"
+        not in environment.stores["node-1"].objects
+    )
+    assert _get_job(environment, cleanup.job_id).status == "COMPLETED"
 
 
 def test_dead_job_can_be_retried_explicitly(
     replication_environment: ReplicationEnvironment,
 ) -> None:
     environment = replication_environment
-    job = environment.db.get(ReplicationJob, environment.job_id)
+    job = _get_job(environment, environment.job_id)
     job.status = "DEAD"
     job.attempt_count = job.max_attempts
     job.last_error = "node unavailable"
@@ -385,7 +752,8 @@ def test_expired_job_lease_is_reclaimed_after_worker_restart(
     environment.db.commit()
 
     assert restarted_claim == environment.job_id
-    assert environment.db.get(ReplicationJob, environment.job_id).attempt_count == 2
+    assert restarted_claim is not None
+    assert _get_job(environment, environment.job_id).attempt_count == 2
 
 
 def test_duplicate_reconciliation_does_not_duplicate_jobs(
@@ -450,7 +818,7 @@ def test_corrupt_source_replica_is_not_used_for_recovery(
 
     assert source_replica.status == "CORRUPT"
     assert environment.file.availability_state == "UNAVAILABLE"
-    assert environment.db.get(ReplicationJob, environment.job_id).status == "RETRY"
+    assert _get_job(environment, environment.job_id).status == "RETRY"
 
 
 def test_database_failure_after_copy_leaves_job_recoverable(
@@ -473,6 +841,7 @@ def test_database_failure_after_copy_leaves_job_recoverable(
     event.listen(environment.db, "before_commit", fail_commit_after_target_write)
     claimed = environment.claim()
     assert claimed == environment.job_id
+    assert claimed is not None
     with pytest.raises(RuntimeError, match="simulated database commit failure"):
         environment.replication.process(
             environment.db,
@@ -487,7 +856,7 @@ def test_database_failure_after_copy_leaves_job_recoverable(
         for name, store in environment.stores.items()
         if name != "node-1"
     )
-    assert environment.db.get(ReplicationJob, environment.job_id).status == "PROCESSING"
+    assert _get_job(environment, environment.job_id).status == "PROCESSING"
 
     restarted_claim = environment.replication.claim_next(
         environment.db,
@@ -495,6 +864,7 @@ def test_database_failure_after_copy_leaves_job_recoverable(
     )
     environment.db.commit()
     assert restarted_claim == environment.job_id
+    assert restarted_claim is not None
     assert environment.replication.process(
         environment.db,
         job_id=restarted_claim,
