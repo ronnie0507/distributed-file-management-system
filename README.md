@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Distributed File Metadata Access and Management System
 
 This repository implements the blueprint as a phased project. It starts with Phase 1:
@@ -44,3 +45,7 @@ Stop the environment with `docker compose down`. Add `-v` only when deleting dev
 ## Repository layout
 
 See `docs/folder-structure.md` for the target structure and ownership split.
+=======
+# distributed-file-management-system
+A distributed file metadata access and management system featuring centralized API services, multiple metadata and storage nodes, intelligent file distribution, replication, fault tolerance, data integrity, and secure access control.
+>>>>>>> 5b9f903fdf626524408b482f1313dc70f651449c
