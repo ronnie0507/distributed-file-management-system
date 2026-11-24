@@ -1,0 +1,101 @@
+openapi: 3.1.0
+info:
+  title: Distributed File Metadata API
+  version: 0.1.0
+paths:
+  /api/health:
+    get:
+      summary: Foundation health check
+      responses:
+        "200":
+          description: Service is running
+  /api/files/upload:
+    post:
+      summary: Upload a file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "202": {description: Upload accepted}
+        "400": {description: Invalid request}
+        "413": {description: File too large}
+  /api/files:
+    get:
+      summary: List accessible files
+      responses:
+        "200": {description: File list}
+  /api/files/{file_id}:
+    get:
+      summary: Retrieve file metadata
+      parameters:
+        - $ref: "#/components/parameters/FileId"
+      responses:
+        "200": {description: File metadata}
+        "404": {description: File not found}
+    delete:
+      summary: Delete a file
+      parameters:
+        - $ref: "#/components/parameters/FileId"
+      responses:
+        "204": {description: File deleted}
+        "404": {description: File not found}
+  /api/files/{file_id}/download:
+    get:
+      summary: Download file content
+      parameters:
+        - $ref: "#/components/parameters/FileId"
+      responses:
+        "200":
+          description: File stream
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+  /api/files/{file_id}/versions:
+    get:
+      summary: List immutable versions
+      parameters:
+        - $ref: "#/components/parameters/FileId"
+      responses:
+        "200": {description: Version list}
+  /api/files/{file_id}/restore:
+    post:
+      summary: Restore a historical version
+      parameters:
+        - $ref: "#/components/parameters/FileId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version_number]
+              properties:
+                version_number:
+                  type: integer
+                  minimum: 1
+      responses:
+        "202": {description: Restore accepted}
+  /api/nodes/health:
+    get:
+      summary: Report metadata and storage node health
+      responses:
+        "200": {description: Node health snapshot}
+components:
+  parameters:
+    FileId:
+      name: file_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
