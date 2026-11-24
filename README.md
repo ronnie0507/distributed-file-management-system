@@ -1,27 +1,33 @@
-<<<<<<< HEAD
 # Distributed File Metadata Access and Management System
 
-This repository implements the blueprint as a phased project. It starts with Phase 1:
-architecture, database, container infrastructure, API contract, and development task
-breakdown.
+This repository implements the project blueprint in phases, beginning with
+architecture, database, container infrastructure, and the API contract.
 
-## Phase 1 status
+## Phase 1 - Foundation
 
 - [x] Architecture and engine responsibilities
 - [x] PostgreSQL metadata schema
 - [x] Docker Compose infrastructure
-- [x] API specification
-- [x] Node communication and failure design
-- [x] Initial FastAPI project skeleton
-- [ ] Application implementation (Phase 2)
+- [x] API specification and failure-handling design
+- [x] FastAPI project skeleton
 
-## Phase 2 status
+## Phase 2 - Networking and API
 
 - [x] Nginx reverse proxy and request limits
 - [x] Modular FastAPI route structure
 - [x] Structured validation and HTTP errors
 - [x] Planned file and node API endpoints
-- [ ] Container and integration verification
+- [x] Focused API tests
+- [ ] Container verification (Docker engine unavailable on the development machine)
+
+## Phase 3 - Engine Development
+
+- [x] Metadata ORM models and database session factory
+- [x] Owner-scoped metadata operations and upload-state transitions
+- [x] Initial immutable file version recorded with metadata
+- [ ] Authenticated API integration (Access Engine prerequisite)
+- [x] MinIO streaming content adapter with SHA-256 and size bounds (File Engine)
+- [ ] Storage-node placement and replication (Distribution Engine)
 
 ## Quick start
 
@@ -40,12 +46,9 @@ The foundation exposes:
 - Redis: `localhost:6379`
 - MinIO console: `http://localhost:9001`
 
-Stop the environment with `docker compose down`. Add `-v` only when deleting development data.
+Stop with `docker compose down`. Add `-v` only when deleting development data.
 
 ## Repository layout
 
-See `docs/folder-structure.md` for the target structure and ownership split.
-=======
-# distributed-file-management-system
-A distributed file metadata access and management system featuring centralized API services, multiple metadata and storage nodes, intelligent file distribution, replication, fault tolerance, data integrity, and secure access control.
->>>>>>> 5b9f903fdf626524408b482f1313dc70f651449c
+See [docs/folder-structure.md](docs/folder-structure.md) for the target structure
+and ownership split.

@@ -21,6 +21,19 @@
 | N4 | Add API tests | Focused communication tests pass |
 | N5 | Verify containers | Compose starts gateway and backend successfully |
 
+## Phase 3 - Engine Development
+
+| ID | Task | Exit condition |
+|---|---|---|
+| E1 | Metadata persistence models | ORM maps users, files, and immutable versions |
+| E2 | Metadata operations | Owner-scoped create, list, lookup, soft delete, and state changes |
+| E3 | File Engine | Content is checksummed and stored/retrieved through MinIO |
+| E4 | Access Engine | API derives owner identity from verified credentials |
+| E5 | Distribution Engine | Replicas are placed and tracked across healthy nodes |
+
+E1-E3 have started. File API writes remain unwired until E4 provides a trusted
+authenticated owner identity; accepting a client-supplied owner ID would be unsafe.
+
 ## Team ownership
 
 | Member | Primary work | Shared area |

@@ -46,6 +46,10 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fileadmin:change-me@postgres:5432/file_metadata}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin-change-me}
+      MINIO_BUCKET: ${MINIO_BUCKET:-distributed-files}
     ports:
       - "8000:8000"
     depends_on:
@@ -53,6 +57,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_started
 
   nginx:
     image: nginx:1.27-alpine
