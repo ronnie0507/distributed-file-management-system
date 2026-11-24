@@ -57,6 +57,11 @@ class FileMetadata(Base):
             "upload_state IN ('PENDING', 'UPLOADED', 'REPLICATING', 'AVAILABLE', 'FAILED')",
             name="files_upload_state_check",
         ),
+        CheckConstraint(
+            "availability_state IN ('AVAILABLE', 'DEGRADED', 'UNAVAILABLE')",
+            name="files_availability_state_check",
+        ),
+        CheckConstraint("replication_factor > 0", name="files_replication_factor_check"),
         Index("idx_files_owner_id", "owner_id"),
         Index("idx_files_filename", "filename"),
         Index("idx_files_checksum", "checksum"),
@@ -76,6 +81,12 @@ class FileMetadata(Base):
     current_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     upload_state: Mapped[str] = mapped_column(
         String(20), nullable=False, default="PENDING"
+    )
+    availability_state: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="UNAVAILABLE"
+    )
+    replication_factor: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -173,11 +184,13 @@ class FileReplica(Base):
     __tablename__ = "file_replicas"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('PENDING', 'UPLOADING', 'AVAILABLE', 'CORRUPT', 'MISSING')",
+            "status IN ('PENDING', 'COPYING', 'VERIFIED', 'FAILED', 'DELETED', 'CORRUPT', 'MISSING')",
             name="file_replicas_status_check",
         ),
         UniqueConstraint("node_id", "object_key", name="uq_replica_node_object"),
+        UniqueConstraint("version_id", "node_id", name="uq_replica_version_node"),
         Index("idx_file_replicas_file_id", "file_id"),
+        Index("idx_file_replicas_version_id", "version_id"),
         Index("idx_file_replicas_node_id", "node_id"),
     )
 
@@ -187,14 +200,69 @@ class FileReplica(Base):
     file_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("files.file_id", ondelete="CASCADE"), nullable=False
     )
+    version_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_versions.version_id", ondelete="CASCADE"),
+        nullable=False,
+    )
     node_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("storage_nodes.node_id"), nullable=False
     )
     object_key: Mapped[str] = mapped_column(Text, nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    error_message: Mapped[str | None] = mapped_column(Text)
     checksum_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class ReplicationJob(Base):
+    __tablename__ = "replication_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'PROCESSING', 'RETRY', 'COMPLETED', 'DEAD')",
+            name="replication_jobs_status_check",
+        ),
+        CheckConstraint("target_count > 0", name="replication_jobs_target_count_check"),
+        CheckConstraint("attempt_count >= 0", name="replication_jobs_attempt_count_check"),
+        CheckConstraint("max_attempts > 0", name="replication_jobs_max_attempts_check"),
+        UniqueConstraint("idempotency_key", name="uq_replication_job_idempotency"),
+        Index("idx_replication_jobs_due", "status", "available_at"),
+    )
+
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    file_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("files.file_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_versions.version_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

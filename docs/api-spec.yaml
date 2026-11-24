@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Distributed File Metadata API
-  version: 0.3.0
+  version: 0.4.0
 paths:
   /api/health:
     get:
@@ -67,11 +67,11 @@ paths:
                   type: string
                   format: binary
       responses:
-        "201": {description: Content stored and metadata committed}
+        "201": {description: Primary replica verified and replication job persisted}
         "400": {description: Invalid request}
         "401": {description: Missing or invalid token}
         "413": {description: File too large}
-        "503": {description: Metadata or object storage unavailable}
+        "503": {description: Metadata, storage, or placement unavailable}
   /api/files:
     get:
       summary: List files owned by the authenticated account
@@ -114,12 +114,14 @@ paths:
         - $ref: "#/components/parameters/FileId"
       responses:
         "200":
-          description: File stream
+          description: Checksum-verified stream from a healthy replica
           content:
             application/octet-stream:
               schema:
                 type: string
                 format: binary
+        "404": {description: File not found or access denied}
+        "503": {description: No verified healthy replica is readable}
   /api/files/{file_id}/versions:
     get:
       summary: List immutable versions
@@ -201,6 +203,22 @@ paths:
       responses:
         "202": {description: Health record accepted}
         "403": {description: Administrator role required}
+  /api/nodes/replication-jobs/{job_id}/retry:
+    post:
+      summary: Retry a dead replication job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "202": {description: Replication job queued}
+        "403": {description: Administrator role required}
+        "409": {description: Job does not exist or is not retryable}
 components:
   parameters:
     FileId:

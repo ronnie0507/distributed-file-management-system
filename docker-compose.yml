@@ -28,17 +28,52 @@ services:
       timeout: 5s
       retries: 20
 
-  minio:
+  minio-node-1:
     image: minio/minio:latest
-    command: server /data --console-address ":9001"
+    command: server /data
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin-change-me}
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      MINIO_ROOT_USER: ${STORAGE_NODE_1_ACCESS_KEY:-${MINIO_ROOT_USER:?Set storage node 1 credentials in .env}}
+      MINIO_ROOT_PASSWORD: ${STORAGE_NODE_1_SECRET_KEY:-${MINIO_ROOT_PASSWORD:?Set storage node 1 credentials in .env}}
     volumes:
       - minio_data:/data
+
+  minio-node-2:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_NODE_2_ACCESS_KEY:?Set STORAGE_NODE_2_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${STORAGE_NODE_2_SECRET_KEY:?Set STORAGE_NODE_2_SECRET_KEY in .env}
+    volumes:
+      - minio_node_2_data:/data
+
+  minio-node-3:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_NODE_3_ACCESS_KEY:?Set STORAGE_NODE_3_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${STORAGE_NODE_3_SECRET_KEY:?Set STORAGE_NODE_3_SECRET_KEY in .env}
+    volumes:
+      - minio_node_3_data:/data
+
+  minio-node-4:
+    image: minio/minio:latest
+    profiles: ["spare"]
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_NODE_4_ACCESS_KEY:?Set STORAGE_NODE_4_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${STORAGE_NODE_4_SECRET_KEY:?Set STORAGE_NODE_4_SECRET_KEY in .env}
+    volumes:
+      - minio_node_4_data:/data
+
+  migrate:
+    build:
+      context: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fileadmin:change-me@postgres:5432/file_metadata}
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   backend:
     build:
@@ -46,19 +81,92 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fileadmin:change-me@postgres:5432/file_metadata}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin-change-me}
       MINIO_BUCKET: ${MINIO_BUCKET:-distributed-files}
+      MINIO_ENDPOINT: minio-node-1:9000
+      MINIO_ACCESS_KEY: ${STORAGE_NODE_1_ACCESS_KEY:-${MINIO_ROOT_USER:?Set storage node 1 credentials in .env}}
+      MINIO_SECRET_KEY: ${STORAGE_NODE_1_SECRET_KEY:-${MINIO_ROOT_PASSWORD:?Set storage node 1 credentials in .env}}
+      STORAGE_NODE_COUNT: ${STORAGE_NODE_COUNT:-3}
+      STORAGE_REPLICATION_FACTOR: ${STORAGE_REPLICATION_FACTOR:-3}
+      STORAGE_NODE_1_NAME: ${STORAGE_NODE_1_NAME:-node-1}
+      STORAGE_NODE_1_ENDPOINT: minio-node-1:9000
+      STORAGE_NODE_1_ACCESS_KEY: ${STORAGE_NODE_1_ACCESS_KEY:-${MINIO_ROOT_USER:?Set storage node 1 credentials in .env}}
+      STORAGE_NODE_1_SECRET_KEY: ${STORAGE_NODE_1_SECRET_KEY:-${MINIO_ROOT_PASSWORD:?Set storage node 1 credentials in .env}}
+      STORAGE_NODE_1_CAPACITY_BYTES: ${STORAGE_NODE_1_CAPACITY_BYTES:-10737418240}
+      STORAGE_NODE_2_NAME: ${STORAGE_NODE_2_NAME:-node-2}
+      STORAGE_NODE_2_ENDPOINT: minio-node-2:9000
+      STORAGE_NODE_2_ACCESS_KEY: ${STORAGE_NODE_2_ACCESS_KEY:?Set STORAGE_NODE_2_ACCESS_KEY in .env}
+      STORAGE_NODE_2_SECRET_KEY: ${STORAGE_NODE_2_SECRET_KEY:?Set STORAGE_NODE_2_SECRET_KEY in .env}
+      STORAGE_NODE_2_CAPACITY_BYTES: ${STORAGE_NODE_2_CAPACITY_BYTES:-10737418240}
+      STORAGE_NODE_3_NAME: ${STORAGE_NODE_3_NAME:-node-3}
+      STORAGE_NODE_3_ENDPOINT: minio-node-3:9000
+      STORAGE_NODE_3_ACCESS_KEY: ${STORAGE_NODE_3_ACCESS_KEY:?Set STORAGE_NODE_3_ACCESS_KEY in .env}
+      STORAGE_NODE_3_SECRET_KEY: ${STORAGE_NODE_3_SECRET_KEY:?Set STORAGE_NODE_3_SECRET_KEY in .env}
+      STORAGE_NODE_3_CAPACITY_BYTES: ${STORAGE_NODE_3_CAPACITY_BYTES:-10737418240}
+      STORAGE_NODE_4_NAME: ${STORAGE_NODE_4_NAME:-node-4}
+      STORAGE_NODE_4_ENDPOINT: minio-node-4:9000
+      STORAGE_NODE_4_ACCESS_KEY: ${STORAGE_NODE_4_ACCESS_KEY:?Set STORAGE_NODE_4_ACCESS_KEY in .env}
+      STORAGE_NODE_4_SECRET_KEY: ${STORAGE_NODE_4_SECRET_KEY:?Set STORAGE_NODE_4_SECRET_KEY in .env}
+      STORAGE_NODE_4_CAPACITY_BYTES: ${STORAGE_NODE_4_CAPACITY_BYTES:-10737418240}
+      STORAGE_HEARTBEAT_TTL_SECONDS: ${STORAGE_HEARTBEAT_TTL_SECONDS:-60}
+      REPLICATION_JOB_LEASE_SECONDS: ${REPLICATION_JOB_LEASE_SECONDS:-300}
+      REPLICATION_MAX_ATTEMPTS: ${REPLICATION_MAX_ATTEMPTS:-5}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-      minio:
+      minio-node-1:
+        condition: service_started
+      minio-node-2:
+        condition: service_started
+      minio-node-3:
+        condition: service_started
+
+  replication-worker:
+    build:
+      context: ./backend
+    command: ["python", "-m", "workers.replication_worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fileadmin:change-me@postgres:5432/file_metadata}
+      MINIO_BUCKET: ${MINIO_BUCKET:-distributed-files}
+      STORAGE_NODE_COUNT: ${STORAGE_NODE_COUNT:-3}
+      STORAGE_REPLICATION_FACTOR: ${STORAGE_REPLICATION_FACTOR:-3}
+      STORAGE_NODE_1_NAME: ${STORAGE_NODE_1_NAME:-node-1}
+      STORAGE_NODE_1_ENDPOINT: minio-node-1:9000
+      STORAGE_NODE_1_ACCESS_KEY: ${STORAGE_NODE_1_ACCESS_KEY:-${MINIO_ROOT_USER:?Set storage node 1 credentials in .env}}
+      STORAGE_NODE_1_SECRET_KEY: ${STORAGE_NODE_1_SECRET_KEY:-${MINIO_ROOT_PASSWORD:?Set storage node 1 credentials in .env}}
+      STORAGE_NODE_1_CAPACITY_BYTES: ${STORAGE_NODE_1_CAPACITY_BYTES:-10737418240}
+      STORAGE_NODE_2_NAME: ${STORAGE_NODE_2_NAME:-node-2}
+      STORAGE_NODE_2_ENDPOINT: minio-node-2:9000
+      STORAGE_NODE_2_ACCESS_KEY: ${STORAGE_NODE_2_ACCESS_KEY:?Set STORAGE_NODE_2_ACCESS_KEY in .env}
+      STORAGE_NODE_2_SECRET_KEY: ${STORAGE_NODE_2_SECRET_KEY:?Set STORAGE_NODE_2_SECRET_KEY in .env}
+      STORAGE_NODE_2_CAPACITY_BYTES: ${STORAGE_NODE_2_CAPACITY_BYTES:-10737418240}
+      STORAGE_NODE_3_NAME: ${STORAGE_NODE_3_NAME:-node-3}
+      STORAGE_NODE_3_ENDPOINT: minio-node-3:9000
+      STORAGE_NODE_3_ACCESS_KEY: ${STORAGE_NODE_3_ACCESS_KEY:?Set STORAGE_NODE_3_ACCESS_KEY in .env}
+      STORAGE_NODE_3_SECRET_KEY: ${STORAGE_NODE_3_SECRET_KEY:?Set STORAGE_NODE_3_SECRET_KEY in .env}
+      STORAGE_NODE_3_CAPACITY_BYTES: ${STORAGE_NODE_3_CAPACITY_BYTES:-10737418240}
+      STORAGE_NODE_4_NAME: ${STORAGE_NODE_4_NAME:-node-4}
+      STORAGE_NODE_4_ENDPOINT: minio-node-4:9000
+      STORAGE_NODE_4_ACCESS_KEY: ${STORAGE_NODE_4_ACCESS_KEY:?Set STORAGE_NODE_4_ACCESS_KEY in .env}
+      STORAGE_NODE_4_SECRET_KEY: ${STORAGE_NODE_4_SECRET_KEY:?Set STORAGE_NODE_4_SECRET_KEY in .env}
+      STORAGE_NODE_4_CAPACITY_BYTES: ${STORAGE_NODE_4_CAPACITY_BYTES:-10737418240}
+      STORAGE_HEALTH_INTERVAL_SECONDS: ${STORAGE_HEALTH_INTERVAL_SECONDS:-10}
+      REPLICATION_POLL_SECONDS: ${REPLICATION_POLL_SECONDS:-2}
+      STORAGE_HEARTBEAT_TTL_SECONDS: ${STORAGE_HEARTBEAT_TTL_SECONDS:-60}
+      REPLICATION_JOB_LEASE_SECONDS: ${REPLICATION_JOB_LEASE_SECONDS:-300}
+      REPLICATION_MAX_ATTEMPTS: ${REPLICATION_MAX_ATTEMPTS:-5}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-node-1:
+        condition: service_started
+      minio-node-2:
+        condition: service_started
+      minio-node-3:
         condition: service_started
 
   nginx:
@@ -74,3 +182,6 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
+  minio_node_2_data:
+  minio_node_3_data:
+  minio_node_4_data:

@@ -1,6 +1,6 @@
 import hashlib
 from bisect import bisect_left
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import select
@@ -137,14 +137,24 @@ class DistributionEngine:
         file_id: UUID,
         replica_count: int = 3,
         file_size_bytes: int = 0,
+        exclude_node_ids: set[UUID] | None = None,
+        health_ttl_seconds: int = 60,
     ) -> list[StorageNode]:
         if file_size_bytes < 0:
             raise ValueError("file_size_bytes must not be negative")
+        if health_ttl_seconds < 1:
+            raise ValueError("health_ttl_seconds must be positive")
+        excluded = exclude_node_ids or set()
+        healthy_after = datetime.now(timezone.utc) - timedelta(
+            seconds=health_ttl_seconds
+        )
         candidates = list(
             db.scalars(
                 select(StorageNode)
                 .where(
                     StorageNode.status == "healthy",
+                    StorageNode.last_heartbeat_at >= healthy_after,
+                    StorageNode.node_id.not_in(excluded),
                     (StorageNode.capacity_bytes.is_(None))
                     | (
                         (StorageNode.used_bytes < StorageNode.capacity_bytes)

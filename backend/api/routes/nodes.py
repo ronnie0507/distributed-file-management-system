@@ -1,3 +1,5 @@
+import os
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -8,14 +10,16 @@ from sqlalchemy.orm import Session
 
 if __package__ == "backend.api.routes":
     from ...api.dependencies import require_admin
-    from ...database.models import NodeHealth, StorageNode, User
+    from ...database.models import NodeHealth, ReplicationJob, StorageNode, User
     from ...database.session import get_db
     from ...engines.distribution import distribution_engine
+    from ...engines.replication import replication_engine
 else:
     from api.dependencies import require_admin
-    from database.models import NodeHealth, StorageNode, User
+    from database.models import NodeHealth, ReplicationJob, StorageNode, User
     from database.session import get_db
     from engines.distribution import distribution_engine
+    from engines.replication import replication_engine
 
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
@@ -36,12 +40,27 @@ class HeartbeatRequest(BaseModel):
 @router.get("/health")
 def node_health(db: Session = Depends(get_db)) -> dict:
     nodes = db.scalars(select(StorageNode).order_by(StorageNode.node_name))
+    heartbeat_cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=int(os.getenv("STORAGE_HEARTBEAT_TTL_SECONDS", "60"))
+    )
+    def display_status(node: StorageNode) -> str:
+        if node.last_heartbeat_at is None:
+            return node.status
+        last_heartbeat = node.last_heartbeat_at
+        if last_heartbeat.tzinfo is None:
+            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+        return (
+            node.status
+            if last_heartbeat >= heartbeat_cutoff
+            else "offline"
+        )
+
     return {
         "storage_nodes": [
             {
                 "node_id": node.node_id,
                 "node_name": node.node_name,
-                "status": node.status,
+                "status": display_status(node),
                 "capacity_bytes": node.capacity_bytes,
                 "used_bytes": node.used_bytes,
                 "last_heartbeat_at": node.last_heartbeat_at,
@@ -110,3 +129,32 @@ def record_heartbeat(
         )
     db.commit()
     return {"node_id": node_id, "status": health.status, "recorded_at": health.recorded_at}
+
+
+@router.post(
+    "/replication-jobs/{job_id}/retry",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def retry_replication_job(
+    job_id: UUID,
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    job: ReplicationJob | None = replication_engine.retry_dead_job(
+        db,
+        job_id=job_id,
+    )
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "REPLICATION_JOB_NOT_RETRYABLE",
+                "message": "The replication job does not exist or is not dead.",
+            },
+        )
+    db.commit()
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "attempt_count": job.attempt_count,
+    }

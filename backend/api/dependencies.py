@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -9,11 +11,13 @@ if __package__ == "backend.api":
     from ..database.session import get_db
     from ..engines.access import access_engine
     from ..engines.files import FileEngine, create_file_engine
+    from ..engines.storage import StorageRegistry, create_storage_registry
 else:
     from database.models import User
     from database.session import get_db
     from engines.access import access_engine
     from engines.files import FileEngine, create_file_engine
+    from engines.storage import StorageRegistry, create_storage_registry
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -71,3 +75,8 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
 
 def get_file_engine() -> FileEngine:
     return create_file_engine()
+
+
+@lru_cache(maxsize=1)
+def get_storage_registry() -> StorageRegistry:
+    return create_storage_registry()

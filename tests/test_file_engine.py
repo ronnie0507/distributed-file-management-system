@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from backend.engines.files import FileEngine, FileTooLargeError
+from backend.engines.files import ChecksumMismatchError, FileEngine, FileTooLargeError
 
 
 class MemoryObjectReader(BytesIO):
@@ -20,6 +20,7 @@ class MemoryObjectStore:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.metadata: dict[str, tuple[str, str]] = {}
+        self.corrupt_writes = False
 
     def put_object(
         self,
@@ -33,6 +34,8 @@ class MemoryObjectStore:
     ) -> None:
         content = data.read()
         assert len(content) == size_bytes
+        if self.corrupt_writes:
+            content += b"corruption"
         self.objects[f"{bucket}/{object_key}"] = content
         self.metadata[object_key] = (content_type, checksum)
 
@@ -88,6 +91,22 @@ def test_store_content_enforces_size_limit_before_storage() -> None:
             file_id=uuid4(),
             version_number=1,
             source=BytesIO(b"12345"),
+            content_type="text/plain",
+        )
+
+    assert store.objects == {}
+
+
+def test_store_content_rejects_and_cleans_up_corrupted_write() -> None:
+    store = MemoryObjectStore()
+    store.corrupt_writes = True
+    engine = FileEngine(store)
+
+    with pytest.raises(ChecksumMismatchError):
+        engine.store_content(
+            file_id=uuid4(),
+            version_number=1,
+            source=BytesIO(b"valid input"),
             content_type="text/plain",
         )
 

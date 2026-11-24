@@ -31,8 +31,10 @@
 | E4 | Access Engine | Passwords, signed tokens, and file permissions are verified |
 | E5 | Distribution Engine | Healthy nodes are reported and deterministic replica targets selected |
 
-E1-E5 are implemented. Physical cross-node replication, repair workers, and restore
-operations remain future work.
+E1-E5 are implemented. Phase 4 adds versioned replica metadata, Alembic migration,
+three private MinIO endpoints, checksum-verified replication, a durable PostgreSQL
+worker queue, recovery, and authorized replica-aware downloads. Restore/version
+replacement remains future work. Live PostgreSQL/MinIO validation is still required.
 
 ## Team ownership
 

@@ -1,5 +1,7 @@
-from uuid import UUID, uuid4
+from datetime import datetime, timedelta, timezone
+import os
 from urllib.parse import quote
+from uuid import UUID, uuid4
 from urllib3.exceptions import HTTPError
 
 from fastapi import (
@@ -20,19 +22,40 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 if __package__ == "backend.api.routes":
-    from ...api.dependencies import get_current_user, get_file_engine
-    from ...database.models import FileMetadata, FileVersion, User
+    from ...api.dependencies import get_current_user, get_storage_registry
+    from ...database.models import (
+        FileMetadata,
+        FileReplica,
+        FileVersion,
+        StorageNode,
+        User,
+    )
     from ...database.session import get_db
     from ...engines.access import access_engine
-    from ...engines.files import FileEngine, FileTooLargeError
+    from ...engines.distribution import (
+        InsufficientHealthyNodesError,
+        distribution_engine,
+    )
+    from ...engines.files import (
+        ChecksumMismatchError,
+        FileEngine,
+        FileTooLargeError,
+        MAX_FILE_SIZE_BYTES,
+    )
     from ...engines.metadata import metadata_engine
+    from ...engines.replication import replication_engine
+    from ...engines.storage import StorageRegistry
 else:
-    from api.dependencies import get_current_user, get_file_engine
-    from database.models import FileMetadata, FileVersion, User
+    from api.dependencies import get_current_user, get_storage_registry
+    from database.models import FileMetadata, FileReplica, FileVersion, StorageNode, User
     from database.session import get_db
     from engines.access import access_engine
-    from engines.files import FileEngine, FileTooLargeError
+    from engines.distribution import InsufficientHealthyNodesError, distribution_engine
+    from engines.files import ChecksumMismatchError, FileEngine, FileTooLargeError
+    from engines.files import MAX_FILE_SIZE_BYTES
     from engines.metadata import metadata_engine
+    from engines.replication import replication_engine
+    from engines.storage import StorageRegistry
 
 
 router = APIRouter(prefix="/api/files", tags=["files"])
@@ -48,6 +71,8 @@ class FileSummary(BaseModel):
     mime_type: str | None
     current_version: int
     upload_state: str
+    availability_state: str
+    replication_factor: int
 
 
 class RestoreRequest(BaseModel):
@@ -59,11 +84,50 @@ def upload_file(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    file_engine: FileEngine = Depends(get_file_engine),
+    storage: StorageRegistry = Depends(get_storage_registry),
 ) -> FileSummary:
     file_id = uuid4()
     filename = (file.filename or "").strip() or "unnamed"
+    if file.size is not None and file.size > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "code": "FILE_TOO_LARGE",
+                "message": f"File exceeds the {MAX_FILE_SIZE_BYTES}-byte limit",
+            },
+        )
     try:
+        targets = distribution_engine.select_targets(
+            db,
+            file_id=file_id,
+            replica_count=int(os.getenv("STORAGE_REPLICATION_FACTOR", "3")),
+            file_size_bytes=file.size or 0,
+        )
+    except InsufficientHealthyNodesError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "STORAGE_NODES_UNAVAILABLE",
+                "message": "There are not enough healthy storage nodes to accept this file.",
+            },
+        ) from exc
+
+    try:
+        primary_config = storage.for_node(targets[0])
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "STORAGE_CONFIGURATION_ERROR",
+                "message": "The selected storage node is not trusted by this service.",
+            },
+        ) from exc
+
+    try:
+        file_engine = FileEngine(
+            primary_config.object_store,
+            bucket=primary_config.bucket,
+        )
         stored = file_engine.store_content(
             file_id=file_id,
             version_number=1,
@@ -74,6 +138,14 @@ def upload_file(
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail={"code": "FILE_TOO_LARGE", "message": str(exc)},
+        ) from exc
+    except ChecksumMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "STORAGE_CHECKSUM_MISMATCH",
+                "message": "Stored content failed checksum verification.",
+            },
         ) from exc
     except ValueError as exc:
         raise HTTPException(
@@ -99,11 +171,39 @@ def upload_file(
             file_size=stored.size_bytes,
             mime_type=stored.content_type,
         )
+        record.replication_factor = len(targets)
         metadata_engine.transition_upload_state(
             db,
             owner_id=current_user.user_id,
             file_id=file_id,
             new_state="UPLOADED",
+        )
+        version = db.scalar(
+            select(FileVersion).where(
+                FileVersion.file_id == file_id,
+                FileVersion.version_number == 1,
+            )
+        )
+        if version is None:
+            raise RuntimeError("The initial file version was not persisted")
+        db.add(
+            FileReplica(
+                file_id=file_id,
+                version_id=version.version_id,
+                node_id=targets[0].node_id,
+                object_key=stored.object_key,
+                checksum=stored.checksum,
+                status="VERIFIED",
+                checksum_verified_at=datetime.now(timezone.utc),
+            )
+        )
+        record.availability_state = "DEGRADED"
+        replication_engine.enqueue(
+            db,
+            file_id=file_id,
+            version_id=version.version_id,
+            target_count=len(targets),
+            idempotency_key=f"file:{file_id}:version:1:replicas:{len(targets)}",
         )
         db.commit()
     except SQLAlchemyError as database_error:
@@ -122,7 +222,7 @@ def upload_file(
                 "message": "File metadata could not be committed.",
             },
         ) from database_error
-    return record
+    return FileSummary.model_validate(record)
 
 
 @router.get("")
@@ -151,7 +251,7 @@ def get_file_metadata(
     file_id: UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> FileMetadata:
+) -> FileSummary:
     file = db.scalar(
         select(FileMetadata).where(
             FileMetadata.file_id == file_id,
@@ -168,7 +268,7 @@ def get_file_metadata(
             status_code=404,
             detail={"code": "FILE_NOT_FOUND", "message": "File not found."},
         )
-    return file
+    return FileSummary.model_validate(file)
 
 
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -195,7 +295,7 @@ def download_file(
     file_id: UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    file_engine: FileEngine = Depends(get_file_engine),
+    storage: StorageRegistry = Depends(get_storage_registry),
 ) -> Response:
     if not access_engine.can_access_file(
         db, user=current_user, file_id=file_id, required_role="viewer"
@@ -223,31 +323,97 @@ def download_file(
                 "message": "The file is not available for download.",
             },
         )
-    object_key = FileEngine.object_key(
-        file_id=file.file_id,
-        version_number=file.current_version,
-        checksum=file.checksum,
+    version = db.scalar(
+        select(FileVersion).where(
+            FileVersion.file_id == file.file_id,
+            FileVersion.version_number == file.current_version,
+        )
     )
-    try:
-        stored_object = file_engine.open_content(object_key)
-    except (HTTPError, S3Error) as exc:
+    if version is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
-                "code": "OBJECT_STORAGE_UNAVAILABLE",
-                "message": "File content could not be retrieved.",
+                "code": "FILE_UNAVAILABLE",
+                "message": "No current file version is available.",
             },
-        ) from exc
+        )
+    heartbeat_cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=int(os.getenv("STORAGE_HEARTBEAT_TTL_SECONDS", "60"))
+    )
+    replicas = list(
+        db.scalars(
+            select(FileReplica)
+            .join(StorageNode, StorageNode.node_id == FileReplica.node_id)
+            .where(
+                FileReplica.version_id == version.version_id,
+                FileReplica.status == "VERIFIED",
+                StorageNode.status == "healthy",
+                StorageNode.last_heartbeat_at >= heartbeat_cutoff,
+            )
+            .order_by(FileReplica.checksum_verified_at, StorageNode.node_name)
+        )
+    )
+    verified_content = None
+    storage_failures: list[Exception] = []
+    for replica in replicas:
+        node = db.get(StorageNode, replica.node_id)
+        if node is None:
+            continue
+        try:
+            configured = storage.for_node(node)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "STORAGE_CONFIGURATION_ERROR",
+                    "message": "A verified replica is not in the trusted storage configuration.",
+                },
+            ) from exc
+        try:
+            file_engine = FileEngine(
+                configured.object_store,
+                bucket=configured.bucket,
+            )
+            verified_content = file_engine.open_verified_content(
+                replica.object_key,
+                version.checksum,
+            )
+            break
+        except ChecksumMismatchError as exc:
+            replica.status = "CORRUPT"
+            replica.error_message = str(exc)
+            storage_failures.append(exc)
+            replication_engine.refresh_availability(db, file=file)
+            db.commit()
+        except (HTTPError, S3Error, OSError) as exc:
+            distribution_engine.record_heartbeat(
+                db,
+                node_id=node.node_id,
+                status="offline",
+                latency_ms=None,
+                used_bytes=None,
+            )
+            storage_failures.append(exc)
+            replication_engine.refresh_availability(db, file=file)
+            db.commit()
+
+    if verified_content is None:
+        replication_engine.refresh_availability(db, file=file)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "FILE_UNAVAILABLE",
+                "message": "No verified healthy replica is currently readable.",
+            },
+        ) from (storage_failures[0] if storage_failures else None)
 
     def content_stream():
         try:
-            while chunk := stored_object.read(1024 * 1024):
+            while chunk := verified_content.read(1024 * 1024):
                 yield chunk
         finally:
-            try:
-                stored_object.close()
-            finally:
-                stored_object.release_conn()
+            verified_content.close()
 
     return StreamingResponse(
         content_stream(),

@@ -6,8 +6,9 @@ distributed-file-management/
 |-- backend/
 |   |-- api/
 |   |-- engines/
-|   |-- services/
+|   |   |-- storage.py
 |   |-- database/
+|   |-- migrations/
 |   |-- models/
 |   |-- schemas/
 |   |-- workers/
@@ -22,9 +23,7 @@ distributed-file-management/
 |-- infrastructure/etcd/
 |-- infrastructure/prometheus/
 |-- infrastructure/grafana/
-|-- tests/unit/
-|-- tests/integration/
-|-- tests/distributed/
+|-- tests/
 |-- tests/performance/
 `-- docs/
 ```

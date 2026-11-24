@@ -9,9 +9,12 @@ erDiagram
     USERS ||--o{ METADATA_OPERATIONS : initiates
     FILES ||--o{ FILE_VERSIONS : has
     FILES ||--o{ FILE_REPLICAS : has
+    FILE_VERSIONS ||--o{ FILE_REPLICAS : stores
+    FILE_VERSIONS ||--o{ REPLICATION_JOBS : schedules
     FILES ||--o{ PERMISSIONS : controlled_by
     STORAGE_NODES ||--o{ FILE_REPLICAS : stores
     STORAGE_NODES ||--o{ NODE_HEALTH : reports
+    FILES ||--o{ REPLICATION_JOBS : schedules
 
     USERS {
         uuid user_id PK
@@ -28,6 +31,8 @@ erDiagram
         bigint file_size
         int current_version
         string upload_state
+        string availability_state
+        int replication_factor
     }
     FILE_VERSIONS {
         uuid version_id PK
@@ -45,9 +50,20 @@ erDiagram
     FILE_REPLICAS {
         uuid replica_id PK
         uuid file_id FK
+        uuid version_id FK
         uuid node_id FK
         text object_key
+        char checksum
         string status
+    }
+    REPLICATION_JOBS {
+        uuid job_id PK
+        uuid file_id FK
+        uuid version_id FK
+        string idempotency_key UK
+        string status
+        int attempt_count
+        datetime locked_until
     }
     PERMISSIONS {
         uuid permission_id PK
@@ -63,5 +79,12 @@ erDiagram
 - Version numbers are unique within a file and immutable after commit.
 - `checksum` is a lowercase SHA-256 hexadecimal string.
 - Replica records identify content independently of user ownership.
+- A replica is downloadable only in `VERIFIED` state with a fresh healthy node heartbeat.
+- Replica records are unique per file version and storage node.
+- Replication jobs are durable, idempotent, leased, and bounded by a retry limit.
 - Deduplicated content is deleted only after every owner reference is removed.
 - Permissions are checked against PostgreSQL even when Redis metadata is present.
+
+Phase 4 schema changes are applied by Alembic after the baseline `schema.sql` has
+initialized a clean PostgreSQL volume. Legacy replica rows are migrated to an
+unverified state; the worker only backfills legacy objects after checksum validation.

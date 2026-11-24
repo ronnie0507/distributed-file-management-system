@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
@@ -127,6 +128,40 @@ def test_target_selection_accounts_for_requested_file_size(
     )
 
     assert {node.node_id for node in targets} == {node.node_id for node in usable}
+
+
+def test_target_selection_excludes_stale_heartbeats(db_session: Session) -> None:
+    distribution = DistributionEngine()
+    stale = distribution.register_node(
+        db_session,
+        node_name="stale",
+        node_address="http://stale",
+        capacity_bytes=100,
+    )
+    stale.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    stale.status = "healthy"
+    fresh = distribution.register_node(
+        db_session,
+        node_name="fresh",
+        node_address="http://fresh",
+        capacity_bytes=100,
+    )
+    distribution.record_heartbeat(
+        db_session,
+        node_id=fresh.node_id,
+        status="healthy",
+        latency_ms=1,
+        used_bytes=0,
+    )
+    db_session.flush()
+
+    targets = distribution.select_targets(
+        db_session,
+        file_id=uuid4(),
+        replica_count=1,
+    )
+
+    assert [node.node_id for node in targets] == [fresh.node_id]
 
 
 def test_unknown_node_heartbeat_is_not_created(db_session: Session) -> None:

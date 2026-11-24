@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import BinaryIO
 from uuid import UUID
@@ -10,10 +11,17 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.database.base import Base
-from backend.database.models import User
+from backend.database.models import (
+    FileReplica,
+    FileVersion,
+    ReplicationJob,
+    StorageNode,
+    User,
+)
 from backend.database.session import get_db
-from backend.api.dependencies import get_file_engine
-from backend.engines.files import FileEngine
+from backend.api.dependencies import get_storage_registry
+from backend.engines.storage import ConfiguredStorageNode, StorageRegistry
+from backend.database.models import StorageNode
 from backend.engines.metadata import metadata_engine
 from backend.main import app
 
@@ -52,12 +60,23 @@ class MemoryObjectStore:
     def remove_object(self, *, bucket: str, object_key: str) -> None:
         self.objects.pop(f"{bucket}/{object_key}", None)
 
+    def health_check(self) -> None:
+        return None
+
+    def used_bytes(self, bucket: str) -> int:
+        prefix = f"{bucket}/"
+        return sum(
+            len(content)
+            for key, content in self.objects.items()
+            if key.startswith(prefix)
+        )
+
 
 @pytest.fixture
 def api_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Generator[
-    tuple[TestClient, dict[str, str], sessionmaker, MemoryObjectStore],
+    tuple[TestClient, dict[str, str], sessionmaker, dict[str, MemoryObjectStore]],
     None,
     None,
 ]:
@@ -69,15 +88,41 @@ def api_client(
     )
     Base.metadata.create_all(engine)
     test_session = sessionmaker(bind=engine, expire_on_commit=False)
-    object_store = MemoryObjectStore()
-    file_engine = FileEngine(object_store)
+    object_stores = {
+        f"node-{index}": MemoryObjectStore()
+        for index in range(1, 4)
+    }
+    configured_nodes = [
+        ConfiguredStorageNode(
+            node_name=f"node-{index}",
+            node_address=f"node-{index}:9000",
+            capacity_bytes=1024 * 1024,
+            bucket="distributed-files",
+            object_store=object_stores[f"node-{index}"],
+        )
+        for index in range(1, 4)
+    ]
+    storage_registry = StorageRegistry(configured_nodes)
+    with test_session() as db:
+        for configured in configured_nodes:
+            db.add(
+                StorageNode(
+                    node_name=configured.node_name,
+                    node_address=configured.node_address,
+                    status="healthy",
+                    capacity_bytes=configured.capacity_bytes,
+                    used_bytes=0,
+                    last_heartbeat_at=datetime.now(timezone.utc),
+                )
+            )
+        db.commit()
 
     def override_get_db():
         with test_session() as db:
             yield db
 
     app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_file_engine] = lambda: file_engine
+    app.dependency_overrides[get_storage_registry] = lambda: storage_registry
     with TestClient(app) as client:
         registration = client.post(
             "/api/auth/register",
@@ -106,7 +151,7 @@ def api_client(
                 file_size=4,
             )
             db.commit()
-        yield client, headers, test_session, object_store
+        yield client, headers, test_session, object_stores
 
     app.dependency_overrides.clear()
     engine.dispose()
@@ -161,7 +206,7 @@ def test_list_files_is_authenticated_and_validates_pagination(api_client) -> Non
 
 
 def test_authenticated_upload_persists_metadata_and_minio_content(api_client) -> None:
-    client, headers, _, object_store = api_client
+    client, headers, _, object_stores = api_client
     content = b"phase three content"
     response = client.post(
         "/api/files/upload",
@@ -173,12 +218,65 @@ def test_authenticated_upload_persists_metadata_and_minio_content(api_client) ->
     assert response.json()["filename"] == "report.pdf"
     assert response.json()["file_size"] == len(content)
     assert response.json()["upload_state"] == "UPLOADED"
+    assert response.json()["availability_state"] == "DEGRADED"
     file_id = response.json()["file_id"]
 
     download = client.get(f"/api/files/{file_id}/download", headers=headers)
     assert download.status_code == 200
     assert download.content == content
-    assert len(object_store.objects) == 1
+    assert sum(len(store.objects) for store in object_stores.values()) == 1
+
+
+def test_download_uses_another_verified_replica_after_checksum_failure(
+    api_client,
+) -> None:
+    client, headers, test_session, object_stores = api_client
+    content = b"replica survives"
+    uploaded = client.post(
+        "/api/files/upload",
+        files={"file": ("surviving.txt", content, "text/plain")},
+        headers=headers,
+    )
+    file_id = UUID(uploaded.json()["file_id"])
+
+    with test_session() as db:
+        replicas = db.query(FileReplica).filter_by(file_id=file_id).all()
+        assert len(replicas) == 1
+        primary_replica = replicas[0]
+        primary_node = db.get(StorageNode, primary_replica.node_id)
+        assert primary_node is not None
+        replacement_node = (
+            db.query(StorageNode)
+            .filter(StorageNode.node_id != primary_node.node_id)
+            .first()
+        )
+        assert replacement_node is not None
+        replacement_store = object_stores[replacement_node.node_name]
+        object_id = f"distributed-files/{primary_replica.object_key}"
+        replacement_store.objects[object_id] = content
+        db.add(
+            FileReplica(
+                file_id=primary_replica.file_id,
+                version_id=primary_replica.version_id,
+                node_id=replacement_node.node_id,
+                object_key=primary_replica.object_key,
+                checksum=primary_replica.checksum,
+                status="VERIFIED",
+                checksum_verified_at=datetime.now(timezone.utc),
+            )
+        )
+        object_stores[primary_node.node_name].objects[object_id] = b"corrupted"
+        db.commit()
+
+    download = client.get(
+        f"/api/files/{file_id}/download",
+        headers=headers,
+    )
+
+    assert download.status_code == 200
+    assert download.content == content
+    with test_session() as db:
+        assert db.get(FileReplica, primary_replica.replica_id).status == "CORRUPT"
 
 
 def test_invalid_credentials_do_not_issue_a_token(api_client) -> None:
@@ -250,6 +348,7 @@ def test_other_account_cannot_read_or_delete_a_file(api_client) -> None:
     headers = {"Authorization": f"Bearer {token}"}
 
     assert client.get(f"/api/files/{file_id}", headers=headers).status_code == 404
+    assert client.get(f"/api/files/{file_id}/download", headers=headers).status_code == 404
     assert client.delete(f"/api/files/{file_id}", headers=headers).status_code == 404
 
 
@@ -258,7 +357,10 @@ def test_node_health_is_public_but_node_registration_requires_admin(
 ) -> None:
     client, headers, _, _ = api_client
 
-    assert client.get("/api/nodes/health").json()["storage_nodes"] == []
+    assert {
+        node["node_name"]
+        for node in client.get("/api/nodes/health").json()["storage_nodes"]
+    } == {"node-1", "node-2", "node-3"}
     response = client.post(
         "/api/nodes",
         headers=headers,
@@ -300,3 +402,43 @@ def test_admin_can_register_node_and_record_health(api_client) -> None:
     assert heartbeat.status_code == 202
     nodes = client.get("/api/nodes/health").json()["storage_nodes"]
     assert nodes[0]["status"] == "healthy"
+
+
+def test_only_admin_can_retry_dead_replication_job(api_client) -> None:
+    client, headers, test_session, _ = api_client
+    with test_session() as db:
+        owner = db.query(User).filter_by(username="api-user").one()
+        file_version = db.query(FileVersion).filter_by(created_by=owner.user_id).one()
+        job = ReplicationJob(
+            file_id=file_version.file_id,
+            version_id=file_version.version_id,
+            target_count=3,
+            idempotency_key="api-test-retry-job",
+            status="DEAD",
+            attempt_count=5,
+            max_attempts=5,
+            last_error="temporary node failure",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.job_id
+
+    denied = client.post(
+        f"/api/nodes/replication-jobs/{job_id}/retry",
+        headers=headers,
+    )
+    assert denied.status_code == 403
+
+    with test_session() as db:
+        owner = db.query(User).filter_by(username="api-user").one()
+        owner.role = "admin"
+        db.commit()
+
+    response = client.post(
+        f"/api/nodes/replication-jobs/{job_id}/retry",
+        headers=headers,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "PENDING"
+    assert response.json()["attempt_count"] == 0
