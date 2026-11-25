@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -12,12 +12,14 @@ if __package__ == "backend.api.routes":
     from ...api.dependencies import require_admin
     from ...database.models import NodeHealth, ReplicationJob, StorageNode, User
     from ...database.session import get_db
+    from ...engines.audit import record_audit_event
     from ...engines.distribution import distribution_engine
     from ...engines.replication import replication_engine
 else:
     from api.dependencies import require_admin
     from database.models import NodeHealth, ReplicationJob, StorageNode, User
     from database.session import get_db
+    from engines.audit import record_audit_event
     from engines.distribution import distribution_engine
     from engines.replication import replication_engine
 
@@ -38,7 +40,11 @@ class HeartbeatRequest(BaseModel):
 
 
 @router.get("/health")
-def node_health(db: Session = Depends(get_db)) -> dict:
+def node_health(
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
     nodes = db.scalars(select(StorageNode).order_by(StorageNode.node_name))
     heartbeat_cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=int(os.getenv("STORAGE_HEARTBEAT_TTL_SECONDS", "60"))
@@ -55,6 +61,15 @@ def node_health(db: Session = Depends(get_db)) -> dict:
             else "offline"
         )
 
+    record_audit_event(
+        db,
+        action="node_health_viewed",
+        resource_type="storage_nodes",
+        actor_user_id=admin.user_id,
+        ip_address=getattr(request.state, "client_ip", None),
+        request_id=getattr(request.state, "request_id", None),
+    )
+    db.commit()
     return {
         "storage_nodes": [
             {
@@ -72,8 +87,9 @@ def node_health(db: Session = Depends(get_db)) -> dict:
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 def register_node(
+    http_request: Request,
     request: RegisterNodeRequest,
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -82,6 +98,15 @@ def register_node(
             node_name=request.node_name,
             node_address=request.node_address,
             capacity_bytes=request.capacity_bytes,
+        )
+        record_audit_event(
+            db,
+            action="storage_node_registered",
+            resource_type="storage_node",
+            actor_user_id=admin.user_id,
+            resource_id=node.node_id,
+            ip_address=getattr(http_request.state, "client_ip", None),
+            request_id=getattr(http_request.state, "request_id", None),
         )
         db.commit()
     except IntegrityError as exc:
@@ -104,8 +129,9 @@ def register_node(
 @router.post("/{node_id}/heartbeat", status_code=status.HTTP_202_ACCEPTED)
 def record_heartbeat(
     node_id: UUID,
+    http_request: Request,
     request: HeartbeatRequest,
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -127,6 +153,16 @@ def record_heartbeat(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "NODE_NOT_FOUND", "message": "Storage node not found."},
         )
+    record_audit_event(
+        db,
+        action="storage_node_health_reported",
+        resource_type="storage_node",
+        actor_user_id=admin.user_id,
+        resource_id=node_id,
+        ip_address=getattr(http_request.state, "client_ip", None),
+        request_id=getattr(http_request.state, "request_id", None),
+        details={"status": health.status},
+    )
     db.commit()
     return {"node_id": node_id, "status": health.status, "recorded_at": health.recorded_at}
 
@@ -137,7 +173,8 @@ def record_heartbeat(
 )
 def retry_replication_job(
     job_id: UUID,
-    _admin: User = Depends(require_admin),
+    http_request: Request,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     job: ReplicationJob | None = replication_engine.retry_dead_job(
@@ -152,6 +189,15 @@ def retry_replication_job(
                 "message": "The replication job does not exist or is not dead.",
             },
         )
+    record_audit_event(
+        db,
+        action="replication_job_retried",
+        resource_type="replication_job",
+        actor_user_id=admin.user_id,
+        resource_id=job.job_id,
+        ip_address=getattr(http_request.state, "client_ip", None),
+        request_id=getattr(http_request.state, "request_id", None),
+    )
     db.commit()
     return {
         "job_id": job.job_id,

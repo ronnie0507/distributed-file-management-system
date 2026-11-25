@@ -1,6 +1,7 @@
 import hashlib
 import os
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from typing import BinaryIO, IO, Protocol, cast
 from uuid import UUID
@@ -76,6 +77,7 @@ class FileEngine:
         version_number: int,
         source: IO[bytes],
         content_type: str | None,
+        quarantine: bool = False,
     ) -> StoredContent:
         if version_number < 1:
             raise ValueError("version_number must be positive")
@@ -99,12 +101,20 @@ class FileEngine:
                 raise ValueError("file content must not be empty")
 
             digest = checksum.hexdigest()
-            object_key = self.object_key(
-                file_id=file_id,
-                version_number=version_number,
-                checksum=digest,
+            object_key = (
+                self.quarantine_object_key(
+                    file_id=file_id,
+                    version_number=version_number,
+                    checksum=digest,
+                )
+                if quarantine
+                else self.object_key(
+                    file_id=file_id,
+                    version_number=version_number,
+                    checksum=digest,
+                )
             )
-            resolved_content_type = content_type or "application/octet-stream"
+            resolved_content_type = "application/octet-stream"
             spool.seek(0)
             self._object_store.put_object(
                 bucket=self._bucket,
@@ -198,6 +208,32 @@ class FileEngine:
         if version_number < 1:
             raise ValueError("version_number must be positive")
         return f"files/{file_id}/versions/{version_number}/{checksum}"
+
+    @staticmethod
+    def quarantine_object_key(
+        *,
+        file_id: UUID,
+        version_number: int,
+        checksum: str,
+    ) -> str:
+        if version_number < 1:
+            raise ValueError("version_number must be positive")
+        return f"quarantine/{file_id}/versions/{version_number}/{checksum}"
+
+    @staticmethod
+    def sanitize_filename(filename: str | None) -> str:
+        normalized = unicodedata.normalize("NFC", (filename or "").strip())
+        if not normalized or any(
+            unicodedata.category(char).startswith("C") for char in normalized
+        ):
+            raise ValueError("filename is empty or contains control characters")
+        components = normalized.replace("\\", "/").split("/")
+        if any(component in {".", ".."} for component in components):
+            raise ValueError("filename must not contain traversal components")
+        safe_name = components[-1].strip()
+        if not safe_name or len(safe_name) > 255:
+            raise ValueError("filename must contain between 1 and 255 characters")
+        return safe_name
 
 
 class MinioObjectStore:

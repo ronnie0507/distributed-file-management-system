@@ -12,7 +12,17 @@ def _session_factory() -> sessionmaker[Session]:
         "DATABASE_URL",
         "postgresql+psycopg://fileadmin:change-me@localhost:5432/file_metadata",
     )
-    engine = create_engine(database_url, pool_pre_ping=True)
+    engine_options: dict[str, object] = {"pool_pre_ping": True}
+    if database_url.startswith(("postgresql://", "postgresql+")):
+        engine_options.update(
+            {
+                "pool_size": int(os.getenv("DB_POOL_SIZE", "20")),
+                "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "40")),
+                "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "30")),
+                "pool_recycle": int(os.getenv("DB_POOL_RECYCLE_SECONDS", "1800")),
+            }
+        )
+    engine = create_engine(database_url, **engine_options)
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 

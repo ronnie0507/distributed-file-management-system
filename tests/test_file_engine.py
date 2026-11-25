@@ -70,6 +70,40 @@ def test_store_content_streams_to_object_store_with_sha256() -> None:
     )
 
 
+def test_store_content_ignores_client_content_type() -> None:
+    store = MemoryObjectStore()
+    engine = FileEngine(store)
+
+    stored = engine.store_content(
+        file_id=uuid4(),
+        version_number=1,
+        source=BytesIO(b"untrusted content type"),
+        content_type="text/html",
+    )
+
+    assert stored.content_type == "application/octet-stream"
+    assert store.metadata[stored.object_key][0] == "application/octet-stream"
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("report.pdf", "report.pdf"),
+        (r"C:\fakepath\report.pdf", "report.pdf"),
+        ("../secret.txt", None),
+        ("folder/../secret.txt", None),
+        ("", None),
+        ("bad\x00name.txt", None),
+    ],
+)
+def test_sanitize_filename(filename: str, expected: str | None) -> None:
+    if expected is None:
+        with pytest.raises(ValueError):
+            FileEngine.sanitize_filename(filename)
+    else:
+        assert FileEngine.sanitize_filename(filename) == expected
+
+
 def test_store_content_rejects_empty_file() -> None:
     engine = FileEngine(MemoryObjectStore())
 

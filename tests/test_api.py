@@ -12,9 +12,11 @@ from sqlalchemy.pool import StaticPool
 
 from backend.database.base import Base
 from backend.database.models import (
+    AuditLog,
     FileReplica,
     FileVersion,
     OutboxEvent,
+    RefreshSession,
     ReplicationJob,
     StorageNode,
     User,
@@ -24,7 +26,16 @@ from backend.api.dependencies import get_storage_registry
 from backend.engines.storage import ConfiguredStorageNode, StorageRegistry
 from backend.database.models import StorageNode
 from backend.engines.metadata import metadata_engine
+import backend.main as main_module
 from backend.main import app
+
+
+class AllowAllRateLimiter:
+    async def allow(self, _key: str, *, limit: int, window_seconds: int) -> bool:
+        return True
+
+    async def aclose(self) -> None:
+        return None
 
 
 class MemoryObjectReader(BytesIO):
@@ -82,6 +93,12 @@ def api_client(
     None,
 ]:
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-that-is-at-least-32-chars")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setattr(
+        main_module,
+        "create_rate_limiter",
+        lambda: AllowAllRateLimiter(),
+    )
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -175,6 +192,47 @@ def test_register_login_and_current_user(api_client) -> None:
     assert response.json()["role"] == "viewer"
 
 
+def test_refresh_rotation_reuse_detection_and_session_revocation(api_client) -> None:
+    client, headers, session_factory, _ = api_client
+    old_refresh_token = client.cookies.get("dfms_refresh")
+    assert old_refresh_token
+
+    refreshed = client.post("/api/auth/refresh")
+    assert refreshed.status_code == 200
+    new_refresh_token = client.cookies.get("dfms_refresh")
+    assert new_refresh_token and new_refresh_token != old_refresh_token
+    new_headers = {
+        "Authorization": f"Bearer {refreshed.json()['access_token']}"
+    }
+
+    assert client.get("/api/auth/me", headers=headers).status_code == 401
+    reuse = client.post(
+        "/api/auth/refresh",
+        cookies={"dfms_refresh": old_refresh_token},
+    )
+    assert reuse.status_code == 401
+    assert client.get("/api/auth/me", headers=new_headers).status_code == 401
+
+    with session_factory() as db:
+        sessions = list(db.query(RefreshSession).all())
+        assert len(sessions) == 2
+        assert all(session.revoked_at is not None for session in sessions)
+        assert db.query(AuditLog).filter_by(
+            action="refresh_token_reuse_detected"
+        ).count() == 1
+
+
+def test_logout_revokes_the_access_session_and_audits_event(api_client) -> None:
+    client, headers, session_factory, _ = api_client
+
+    response = client.post("/api/auth/logout", headers=headers)
+
+    assert response.status_code == 204
+    assert client.get("/api/auth/me", headers=headers).status_code == 401
+    with session_factory() as db:
+        assert db.query(AuditLog).filter_by(action="logout").count() == 1
+
+
 def test_file_api_requires_a_valid_bearer_token(api_client) -> None:
     client, _, _, _ = api_client
 
@@ -226,6 +284,20 @@ def test_authenticated_upload_persists_metadata_and_minio_content(api_client) ->
     assert download.status_code == 200
     assert download.content == content
     assert sum(len(store.objects) for store in object_stores.values()) == 1
+
+
+def test_upload_rejects_traversal_filename(api_client) -> None:
+    client, headers, _, object_stores = api_client
+
+    response = client.post(
+        "/api/files/upload",
+        files={"file": ("../secret.txt", b"private", "text/plain")},
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_FILENAME"
+    assert all(not store.objects for store in object_stores.values())
 
 
 def test_download_uses_another_verified_replica_after_checksum_failure(
@@ -310,6 +382,29 @@ def test_password_is_not_reflected_in_validation_errors(api_client) -> None:
     assert password not in response.text
 
 
+def test_rate_limit_has_request_id_and_security_headers(api_client) -> None:
+    client, _, _, _ = api_client
+
+    class DenyRateLimiter:
+        async def allow(self, _key: str, *, limit: int, window_seconds: int) -> bool:
+            return False
+
+        async def aclose(self) -> None:
+            return None
+
+    client.app.state.rate_limiter = DenyRateLimiter()
+    response = client.post(
+        "/api/auth/login",
+        json={"email": "anything@example.com", "password": "no-password"},
+        headers={"X-Request-ID": "00000000-0000-0000-0000-000000000123"},
+    )
+
+    assert response.status_code == 429
+    assert response.headers["x-request-id"] == "00000000-0000-0000-0000-000000000123"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["retry-after"] == "60"
+
+
 def test_file_metadata_and_delete_are_owner_scoped(api_client) -> None:
     client, headers, session_factory, _ = api_client
     listing = client.get("/api/files", headers=headers).json()
@@ -361,15 +456,13 @@ def test_other_account_cannot_read_or_delete_a_file(api_client) -> None:
     assert client.delete(f"/api/files/{file_id}", headers=headers).status_code == 404
 
 
-def test_node_health_is_public_but_node_registration_requires_admin(
+def test_node_health_and_registration_require_admin(
     api_client,
 ) -> None:
     client, headers, _, _ = api_client
 
-    assert {
-        node["node_name"]
-        for node in client.get("/api/nodes/health").json()["storage_nodes"]
-    } == {"node-1", "node-2", "node-3"}
+    assert client.get("/api/nodes/health").status_code == 401
+    assert client.get("/api/nodes/health", headers=headers).status_code == 403
     response = client.post(
         "/api/nodes",
         headers=headers,
@@ -407,9 +500,10 @@ def test_admin_can_register_node_and_record_health(api_client) -> None:
         headers=headers,
         json={"status": "healthy", "latency_ms": 3, "used_bytes": 20},
     )
+    health = client.get("/api/nodes/health", headers=headers)
 
     assert heartbeat.status_code == 202
-    nodes = client.get("/api/nodes/health").json()["storage_nodes"]
+    nodes = health.json()["storage_nodes"]
     assert nodes[0]["status"] == "healthy"
 
 

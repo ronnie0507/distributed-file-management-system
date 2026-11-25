@@ -1,6 +1,8 @@
 import logging
 import os
 import time
+import signal
+import threading
 from threading import Thread
 from datetime import datetime, timezone
 from time import perf_counter
@@ -94,6 +96,7 @@ class ReplicationWorker:
         self._last_health_check = 0.0
         self._broker = broker
         self._coordinator = coordinator
+        self._stop_event = threading.Event()
 
     def run_once(self) -> bool:
         with self._session_factory() as db:
@@ -117,6 +120,11 @@ class ReplicationWorker:
             )
 
     def run_forever(self) -> None:
+        def request_shutdown(_signum: int, _frame: object) -> None:
+            self._stop_event.set()
+
+        signal.signal(signal.SIGTERM, request_shutdown)
+        signal.signal(signal.SIGINT, request_shutdown)
         broker = self._broker or RabbitMQTransport(RabbitMQConfig.from_env())
         coordinator = self._coordinator or create_etcd_coordinator()
         dispatcher = OutboxDispatcher(
@@ -134,7 +142,7 @@ class ReplicationWorker:
             name="etcd-coordination",
             daemon=True,
         ).start()
-        while True:
+        while not self._stop_event.is_set():
             try:
                 broker.consume_forever(self._handle_job_message)
             except (
@@ -144,6 +152,7 @@ class ReplicationWorker:
             ):
                 _LOGGER.exception("RabbitMQ connection failed; reconnecting")
                 time.sleep(_POLL_INTERVAL_SECONDS)
+        coordinator.close()
 
     def _handle_job_message(self, message: JobMessage) -> None:
         try:

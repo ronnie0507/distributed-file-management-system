@@ -10,6 +10,7 @@ from fastapi import (
     File,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
     status,
@@ -32,6 +33,7 @@ if __package__ == "backend.api.routes":
     )
     from ...database.session import get_db
     from ...engines.access import access_engine
+    from ...engines.audit import record_audit_event
     from ...engines.distribution import (
         InsufficientHealthyNodesError,
         distribution_engine,
@@ -50,6 +52,7 @@ else:
     from database.models import FileMetadata, FileReplica, FileVersion, StorageNode, User
     from database.session import get_db
     from engines.access import access_engine
+    from engines.audit import record_audit_event
     from engines.distribution import InsufficientHealthyNodesError, distribution_engine
     from engines.files import ChecksumMismatchError, FileEngine, FileTooLargeError
     from engines.files import MAX_FILE_SIZE_BYTES
@@ -81,13 +84,20 @@ class RestoreRequest(BaseModel):
 
 @router.post("/upload", status_code=status.HTTP_201_CREATED)
 def upload_file(
+    request: Request,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     storage: StorageRegistry = Depends(get_storage_registry),
 ) -> FileSummary:
     file_id = uuid4()
-    filename = (file.filename or "").strip() or "unnamed"
+    try:
+        filename = FileEngine.sanitize_filename(file.filename)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_FILENAME", "message": str(exc)},
+        ) from exc
     if file.size is not None and file.size > MAX_FILE_SIZE_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -132,7 +142,7 @@ def upload_file(
             file_id=file_id,
             version_number=1,
             source=file.file,
-            content_type=file.content_type,
+            content_type="application/octet-stream",
         )
     except FileTooLargeError as exc:
         raise HTTPException(
@@ -205,6 +215,16 @@ def upload_file(
             target_count=len(targets),
             idempotency_key=f"file:{file_id}:version:1:replicas:{len(targets)}",
         )
+        record_audit_event(
+            db,
+            action="file_upload",
+            resource_type="file",
+            actor_user_id=current_user.user_id,
+            resource_id=file_id,
+            ip_address=getattr(request.state, "client_ip", None),
+            request_id=getattr(request.state, "request_id", None),
+            details={"size_bytes": stored.size_bytes, "outcome": "accepted"},
+        )
         db.commit()
     except SQLAlchemyError as database_error:
         db.rollback()
@@ -274,6 +294,7 @@ def get_file_metadata(
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_file(
     file_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
@@ -300,6 +321,15 @@ def delete_file(
             ),
             job_type="CLEANUP",
         )
+    record_audit_event(
+        db,
+        action="file_delete",
+        resource_type="file",
+        actor_user_id=current_user.user_id,
+        resource_id=file_id,
+        ip_address=getattr(request.state, "client_ip", None),
+        request_id=getattr(request.state, "request_id", None),
+    )
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -307,6 +337,7 @@ def delete_file(
 @router.get("/{file_id}/download")
 def download_file(
     file_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     storage: StorageRegistry = Depends(get_storage_registry),
@@ -422,6 +453,17 @@ def download_file(
             },
         ) from (storage_failures[0] if storage_failures else None)
 
+    record_audit_event(
+        db,
+        action="file_download_started",
+        resource_type="file",
+        actor_user_id=current_user.user_id,
+        resource_id=file_id,
+        ip_address=getattr(request.state, "client_ip", None),
+        request_id=getattr(request.state, "request_id", None),
+    )
+    db.commit()
+
     def content_stream():
         try:
             while chunk := verified_content.read(1024 * 1024):
@@ -431,10 +473,10 @@ def download_file(
 
     return StreamingResponse(
         content_stream(),
-        media_type=file.mime_type or "application/octet-stream",
+        media_type="application/octet-stream",
         headers={
             "Content-Disposition": (
-                f"attachment; filename*=UTF-8''{quote(file.filename)}"
+                f"attachment; filename*=UTF-8''{quote(file.filename, safe='')}"
             )
         },
     )

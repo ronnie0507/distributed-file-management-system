@@ -37,7 +37,7 @@ def get_current_user(
             },
         )
     try:
-        user_id = access_engine.decode_access_token(credentials.credentials)
+        claims = access_engine.decode_access_token_claims(credentials.credentials)
     except (jwt.InvalidTokenError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -48,7 +48,21 @@ def get_current_user(
             },
         ) from exc
 
-    user = db.scalar(select(User).where(User.user_id == user_id))
+    if claims.session_id is None or not access_engine.active_session(
+        db,
+        session_id=claims.session_id,
+        user_id=claims.user_id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            headers={"WWW-Authenticate": "Bearer"},
+            detail={
+                "code": "INVALID_TOKEN",
+                "message": "The access token session is no longer active.",
+            },
+        )
+
+    user = db.scalar(select(User).where(User.user_id == claims.user_id))
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
